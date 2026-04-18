@@ -1,0 +1,31 @@
+Phase 1: Hardware Prototyping & Sensor Integration
+
+    Print the Gripper: Design or download a 3D-printable parallel or compliant gripper. A compliant fin-ray design like FORTE is excellent because it can use internal air channels to provide low-latency force and slip feedback without requiring complex, expensive sensors.
+
+    Integrate the Camera: Mount a standard, low-cost RGB webcam directly onto the gripper (an eye-in-hand setup). This single camera will provide the multi-view images required for the HEAPGrasp silhouette extraction method.
+
+    Select Edge Hardware: You will need an edge AI computer attached to the robot. An NVIDIA Jetson module (like the Jetson AGX Orin) is highly recommended, as it allows you to fully utilize TensorRT for ultra-fast vision inference.
+
+Phase 2: Core Middleware & Kinematics (ROS 2 + MoveIt)
+
+    Set Up ROS 2: Use ROS 2 as your foundational middleware. Unlike ROS 1, ROS 2 is built with real-time performance constraints in mind, allowing you to establish deterministic control loops with minimal latency.
+
+    Configure MoveIt 2: Integrate MoveIt 2 for trajectory planning and kinematics. Set up your robot's URDF (Unified Robot Description Format) model so you can simulate movements in a physics engine like Gazebo before testing on physical hardware.
+
+Phase 3: Building & Optimizing the Vision Pipeline
+
+    Develop the Silhouette Extractor: Program a Convolutional Neural Network (CNN) to semantically segment the target transparent object from the background based solely on RGB color data, circumventing the depth sensor "invisible object" problem.
+
+    Apply TensorRT Acceleration: Export your trained vision model to ONNX, and then compile it using NVIDIA TensorRT. This step is mandatory for achieving high frame rates (e.g., jumping from 30 FPS to 90 FPS) by mathematically merging neural network layers and using mixed precision.
+
+Phase 4: Slip Reflex & Control Loop Optimization
+
+    Program the Tactile Node: Create a dedicated ROS 2 node to monitor the data coming from your tactile sensors.
+
+    Close the Observation-Execution Gap: Ensure your system can process the tactile data and actuate the gripper in under 100 milliseconds. If the sensor detects the transparent object slipping, the controller should instantly trigger a reflex to tighten the grip.
+
+Phase 5: "Stand-Out" Integrations (VLM & Safety)
+
+    Add VLM Reasoning: Incorporate an open-source Vision-Language Model (VLM) at the top of your software stack. This will allow your system to take natural language commands from the user, look at the RGB feed, and identify exactly which part of the transparent object to grab (e.g., the handle of a clear mug).
+
+    Implement ISO Safety Caps: Finally, hardcode a force-limiting algorithm into your gripper's actuation software that strictly caps the pinch force at 140 N. This explicitly demonstrates to judges that your prototype complies with the new ISO 10218-2:2025 collaborative robot safety standards.
