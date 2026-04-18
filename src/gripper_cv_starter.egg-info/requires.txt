@@ -1,0 +1,7 @@
+numpy>=1.26
+Pillow>=10.0
+simplejpeg>=1.7
+
+[ml]
+torch>=2.2
+torchvision>=0.17

@@ -1,0 +1,5 @@
+[console_scripts]
+gripper-cv-classify = gripper_cv.app_classifier:main
+gripper-cv-heapgrasp = gripper_cv.app_heapgrasp:main
+gripper-cv-mjpeg = gripper_cv.app_mjpeg:main
+gripper-cv-preview = gripper_cv.app_preview:main

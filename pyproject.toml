@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gripper-cv-starter"
+version = "0.1.0"
+description = "Raspberry Pi 5 computer-vision starter for robotic gripper projects."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "Pillow>=10.0",
+    "simplejpeg>=1.7",
+]
+
+[project.optional-dependencies]
+ml = [
+    "torch>=2.2",
+    "torchvision>=0.17",
+]
+training = [
+    "torch>=2.2",
+    "torchvision>=0.17",
+]
+dashboard = [
+    "streamlit>=1.35",
+    "plotly>=5.20",
+    "matplotlib>=3.8",
+]
+hailo = [
+    "hailort",
+]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[project.scripts]
+gripper-cv-preview = "gripper_cv.app_preview:main"
+gripper-cv-classify = "gripper_cv.app_classifier:main"
+gripper-cv-mjpeg = "gripper_cv.app_mjpeg:main"
+gripper-cv-heapgrasp = "gripper_cv.app_heapgrasp:main"
+gripper-cv-train-seg = "gripper_cv.training.train_seg:main"
+gripper-cv-export-onnx = "gripper_cv.training.train_seg:export_main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
