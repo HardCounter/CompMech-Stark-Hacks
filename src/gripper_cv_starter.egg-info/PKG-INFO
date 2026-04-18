@@ -10,6 +10,17 @@ Requires-Dist: simplejpeg>=1.7
 Provides-Extra: ml
 Requires-Dist: torch>=2.2; extra == "ml"
 Requires-Dist: torchvision>=0.17; extra == "ml"
+Provides-Extra: training
+Requires-Dist: torch>=2.2; extra == "training"
+Requires-Dist: torchvision>=0.17; extra == "training"
+Provides-Extra: dashboard
+Requires-Dist: streamlit>=1.35; extra == "dashboard"
+Requires-Dist: plotly>=5.20; extra == "dashboard"
+Requires-Dist: matplotlib>=3.8; extra == "dashboard"
+Provides-Extra: hailo
+Requires-Dist: hailort; extra == "hailo"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
 
 # Gripper CV Starter (Raspberry Pi 5)
 
@@ -84,7 +95,71 @@ PyTorch classification demo:
 gripper-cv-classify --fps 20 --device cpu
 ```
 
-## 4) Helpful next steps for your gripper project
+## 4) HEAPGrasp: shape-from-silhouette + grasp planning
+
+The `gripper_cv.heapgrasp` package implements the full HEAPGrasp pipeline:
+capture → auto-calibrate (ArUco) → segment → voxel carve (visual hull) →
+PLY export → parallel-jaw grasp ranking → `grasps.json`.
+
+### CLI
+
+Run the end-to-end pipeline from the Pi:
+
+```bash
+gripper-cv-heapgrasp \
+    --out outputs/heapgrasp \
+    --n-views 12 \
+    --volume 64 \
+    --segment background \
+    --top-k-grasps 5
+```
+
+The CLI writes `reconstruction.ply`, `voxels.npy`, `masks/*.png`, and
+`grasps.json` into the chosen output directory. See
+`gripper-cv-heapgrasp --help` for all flags, including segmentation backends
+(`background`, `deeplab`, `finetuned`, `hailo`) and the optional learned
+grasp scorer (`--grasp-onnx`, `--grasp-hef`).
+
+### Dashboard
+
+A Streamlit dashboard ships alongside the CLI for interactive exploration:
+
+```bash
+pip install -e .[dashboard]
+streamlit run dashboard/app.py
+```
+
+Features: live capture wizard, segmentation playground, 3D object scan with
+the Next-Best-View planner, Hailo-8L status page, and a theoretical grasp
+plan that shares the same grasp module as the CLI.
+
+### Grasp module
+
+Structured grasp candidates live in
+`gripper_cv.heapgrasp.grasp` (geometric, PCA-based) and
+`gripper_cv.heapgrasp.grasp_learned` (GQ-CNN-style scorer over ONNX
+Runtime or Hailo). Both produce `GraspCandidate` dataclasses with
+`position`, `approach`, `jaw_axis`, `width`, and `score`.
+
+### Optional extras
+
+Declared in `pyproject.toml`:
+
+- `[dashboard]` — Streamlit, Plotly, matplotlib.
+- `[ml]` — PyTorch + torchvision + ONNX Runtime (for the fine-tuned
+  segmenter and learned grasp scorer on CPU).
+- `[hailo]` — `hailo-platform` for NPU inference.
+
+### Tests
+
+```bash
+pytest -q
+```
+
+Covers the SfS core, PLY/npy/JSON export, grasp module, patch renderer,
+NBV planner, and Hailo helpers.
+
+## 5) Helpful next steps for your gripper project
 
 - Add a data capture utility to save frames + labels from the Pi camera.
 - Replace classifier with segmentation/detection model for grasp points.

@@ -71,6 +71,16 @@ def main() -> None:
     parser.add_argument("--seg-img-size", type=int, nargs=2, default=[512, 512],
                         metavar=("H", "W"),
                         help="Image size the Hailo model was compiled for (default: 512 512).")
+    parser.add_argument("--no-grasp", action="store_true",
+                        help="Skip grasp planning and grasps.json export.")
+    parser.add_argument("--top-k-grasps", type=int, default=5, metavar="K",
+                        help="Number of top-ranked grasps to save (default: 5).")
+    parser.add_argument("--grasp-onnx", type=str, default=None, metavar="PATH",
+                        help="Optional ONNX model for a learned grasp quality scorer. "
+                             "Runs on CPU via onnxruntime.")
+    parser.add_argument("--grasp-hef", type=str, default=None, metavar="PATH",
+                        help="Optional compiled .hef for running the grasp scorer "
+                             "on the Hailo-8L NPU.")
 
     args = parser.parse_args()
     run_pipeline(
@@ -92,6 +102,10 @@ def main() -> None:
         n_planner_views=args.n_planner_views,
         hef_path=args.hef_path,
         seg_img_size=tuple(args.seg_img_size),
+        plan_grasp=not args.no_grasp,
+        top_k_grasps=args.top_k_grasps,
+        grasp_onnx_path=args.grasp_onnx,
+        grasp_hef_path=args.grasp_hef,
     )
 
 

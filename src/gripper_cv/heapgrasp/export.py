@@ -6,6 +6,7 @@ PLY files can be opened in MeshLab, CloudCompare, or Open3D.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import List, Optional
 
@@ -52,3 +53,12 @@ def save_voxels_npy(voxels: np.ndarray, path: str | Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     np.save(path, voxels)
     print(f"Saved voxel grid {voxels.shape} → {path}")
+
+
+def save_grasps_json(payload: dict, path: str | Path) -> None:
+    """Save a grasps payload (from ``grasps_to_json``) as pretty-printed JSON."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(payload, f, indent=2)
+    print(f"Saved {len(payload.get('grasps', []))} grasps → {path}")

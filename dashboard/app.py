@@ -35,6 +35,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from gripper_cv.hailo import is_hailo_available
 from gripper_cv.heapgrasp.capture import CaptureSession
+from gripper_cv.heapgrasp.grasp import format_grasp_plan
 from gripper_cv.heapgrasp.reconstruct import (
     default_camera_matrix,
     shape_from_silhouette,
@@ -298,7 +299,7 @@ def _ply_bytes(voxels: np.ndarray, diameter: float) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Grasp plan generator
+# Grasp plan generator — thin wrapper over gripper_cv.heapgrasp.grasp
 # ---------------------------------------------------------------------------
 
 def generate_grasp_plan(
@@ -307,156 +308,8 @@ def generate_grasp_plan(
     cam_dist: float,
     n_views: int,
 ) -> str:
-    """
-    Generate a natural-language arm movement plan from a reconstructed voxel grid.
-
-    Coordinate convention (camera = gripper tip):
-      X  →  right in camera frame  (positive = translate gripper right)
-      Y  →  up in camera frame     (positive = translate gripper up)
-      Z  →  forward (optical axis) (approach direction)
-    """
-    pts = voxels_to_pointcloud(voxels, diameter)
-    if len(pts) < 8:
-        return ("⚠  Insufficient point cloud data.\n"
-                "Capture more views for a reliable grasp plan.")
-
-    centroid, eigvals, eigvecs = _pca(pts)
-
-    # Physical extents (2 × 2.5σ per principal axis), sorted largest first
-    spans_m = sorted(2 * np.sqrt(np.maximum(eigvals, 0)) * 2.5, reverse=True)
-    dim_str = "  ×  ".join(f"{d * 100:.1f} cm" for d in spans_m)
-
-    # Lateral offsets: how far is the object centroid from the camera optical axis?
-    dx_cm = float(centroid[0]) * 100   # +right, −left
-    dy_cm = float(centroid[1]) * 100   # +up,   −down
-
-    # Jaw axis = longest PCA axis (jaws open/close along this)
-    jaw_ax = eigvecs[:, 0]
-
-    # Grasp approach axis = shortest PCA axis (gripper approaches along this)
-    grasp_ax = eigvecs[:, 2]
-
-    # Jaw opening = span along jaw axis + safety clearance
-    jaw_span_cm = float(np.sqrt(max(eigvals[0], 0))) * 5 * 100   # ±2.5σ
-    jaw_open_cm = jaw_span_cm + 1.5
-
-    # Wrist rotation: angle between jaw_ax projected onto image plane and camera X
-    jaw_xy  = np.array([float(jaw_ax[0]), float(jaw_ax[1])])
-    wrist_deg = float(np.degrees(np.arctan2(jaw_xy[1], jaw_xy[0]))) if np.linalg.norm(jaw_xy) > 0.1 else 0.0
-
-    # Descriptive strings
-    _axis_desc  = {0: "horizontal (left-right)", 1: "vertical (up-down)", 2: "axial (depth)"}
-    dominant_jaw   = int(np.argmax(np.abs(jaw_ax)))
-    dominant_grasp = int(np.argmax(np.abs(grasp_ax)))
-    jaw_desc    = _axis_desc[dominant_jaw]
-    grasp_desc  = _axis_desc[dominant_grasp]
-
-    if spans_m[0] > 0.10:
-        grip_type = "two-finger power grip (large object)"
-    elif spans_m[0] < 0.04:
-        grip_type = "precision pinch (small object)"
-    else:
-        grip_type = "standard parallel-jaw pinch"
-
-    fill_pct = 100.0 * int(voxels.sum()) / voxels.size
-    W = 65
-    SEP = "═" * W
-    sec = "─" * (W - 4)
-
-    def _row(label, value, indent=2):
-        return f"{'':>{indent}}{label:<30}{value}"
-
-    lines = [
-        SEP,
-        "  THEORETICAL GRASP PLAN  —  Ford Industrial Arm",
-        f"  {n_views}-view HEAPGrasp reconstruction  |  camera distance {cam_dist*100:.0f} cm",
-        SEP,
-        "",
-        "  OBJECT SUMMARY",
-        f"  {'Estimated dimensions':<28}{dim_str}",
-        f"  {'Jaw span axis':<28}{jaw_desc}",
-        f"  {'Approach axis':<28}{grasp_desc}",
-        f"  {'Recommended grip':<28}{grip_type}",
-        f"  {'Reconstruction fill':<28}{fill_pct:.0f} %  ({int(voxels.sum()):,} occupied voxels)",
-        "",
-        f"  {sec}",
-        "  ①  LATERAL ALIGNMENT",
-        f"  {sec}",
-        "  Camera (mounted at gripper tip) sees the object at:",
-    ]
-
-    if abs(dx_cm) > 0.3:
-        dirn = "right" if dx_cm > 0 else "left"
-        lines.append(f"    • {abs(dx_cm):.1f} cm to the {dirn} of optical centre")
-        lines.append(f"      → Translate TCP {abs(dx_cm):.1f} cm {'right (+X)' if dx_cm > 0 else 'left (−X)'}")
-    else:
-        lines.append("    • Centred horizontally  (no X correction needed)")
-
-    if abs(dy_cm) > 0.3:
-        dirn = "above" if dy_cm > 0 else "below"
-        lines.append(f"    • {abs(dy_cm):.1f} cm {dirn} optical centre")
-        lines.append(f"      → Translate TCP {abs(dy_cm):.1f} cm {'up (+Y)' if dy_cm > 0 else 'down (−Y)'}")
-    else:
-        lines.append("    • Centred vertically    (no Y correction needed)")
-
-    lines += [
-        "",
-        f"  {sec}",
-        "  ②  WRIST ROTATION",
-        f"  {sec}",
-    ]
-    if abs(wrist_deg) > 5.0:
-        dirn = "counter-clockwise" if wrist_deg > 0 else "clockwise"
-        lines += [
-            f"  Jaw axis is {abs(wrist_deg):.0f}° from horizontal in the image plane.",
-            f"    → Rotate wrist {abs(wrist_deg):.0f}°  {dirn}  (align jaws with object long axis)",
-        ]
-    else:
-        lines.append("  Jaw axis is approximately horizontal — no wrist rotation needed.")
-
-    lines += [
-        "",
-        f"  {sec}",
-        "  ③  OPEN JAWS",
-        f"  {sec}",
-        f"  Object span along jaw axis:  {jaw_span_cm:.1f} cm",
-        f"    → Set jaw opening to  {jaw_open_cm:.1f} cm",
-        f"       ({jaw_span_cm:.1f} cm object  +  1.5 cm clearance)",
-        "",
-        f"  {sec}",
-        "  ④  APPROACH",
-        f"  {sec}",
-        f"  Object is {cam_dist * 100:.0f} cm from the gripper tip (along optical axis).",
-        f"    → Advance {cam_dist * 100:.0f} cm along gripper Z-axis.",
-        f"    → Speed: SLOW  —  transparent/specular surface, uncertain contact geometry.",
-        "",
-        f"  {sec}",
-        "  ⑤  GRASP",
-        f"  {sec}",
-        "    → Close jaws to contact resistance.",
-        "    → Target force: LIGHT.  Do not over-squeeze transparent objects.",
-        "    → Monitor SlipDetectorCNN output:",
-        "         stable  →  continue",
-        "         slipping  →  pause, re-seat object, or abort mission.",
-        "",
-        f"  {sec}",
-        "  ⑥  RETRIEVE",
-        f"  {sec}",
-        "    → Raise TCP 5 cm vertically to clear the turntable surface.",
-        "    → Translate to deposit location at REDUCED speed.",
-        "    → Confirm stable hold before increasing speed.",
-        "",
-        SEP,
-        "  ⚠  SAFETY NOTES",
-        "",
-        "  1. This plan is THEORETICAL — generated from camera data only.",
-        "  2. No real arm commands have been issued.",
-        "  3. A human operator must verify all clearances before executing.",
-        "  4. Reconstruction accuracy improves with more views.",
-        f"     Current quality: {fill_pct:.0f}% voxel fill from {n_views} views.",
-        SEP,
-    ]
-    return "\n".join(lines)
+    """Render the natural-language grasp plan via the shared grasp module."""
+    return format_grasp_plan(voxels, diameter, cam_dist, n_views)
 
 
 # ---------------------------------------------------------------------------
@@ -1020,18 +873,66 @@ elif page == "📦 3D Object Scan":
     # ── Build silhouettes ─────────────────────────────────────────────
     if "Live session" in input_mode:
         bg = st.session_state.cap_bg
-        raw_masks, angles = [], []
-        for frame, ang in zip(st.session_state.cap_frames, st.session_state.cap_angles):
-            if frame.shape != bg.shape:
-                frame = np.array(
-                    Image.fromarray(frame).resize((bg.shape[1], bg.shape[0]), Image.LANCZOS)
-                )
-            sess  = CaptureSession(frames=[frame], angles_deg=[ang], background=bg)
-            mask  = extract_silhouettes(sess, method="background", bg_threshold=30)[0]
-            raw_masks.append(mask)
-            angles.append(ang)
 
-        st.success(f"Using live capture session: {len(raw_masks)} views.")
+        with st.expander("🎛 Segmentation method", expanded=False):
+            seg_method = st.radio(
+                "Method",
+                ["background", "deeplab", "finetuned", "hailo"],
+                horizontal=True,
+                help=(
+                    "Same options exposed by `gripper-cv-heapgrasp --segment`. "
+                    "`background` is fastest and works whenever a background "
+                    "frame is available (it always is in Live sessions)."
+                ),
+            )
+            seg_kwargs: dict = {}
+            if seg_method == "background":
+                seg_kwargs["bg_threshold"] = st.slider(
+                    "Background threshold", 5, 80, 30, 1
+                )
+            elif seg_method == "finetuned":
+                ck = st.text_input(
+                    "Fine-tuned checkpoint path (.pt)",
+                    value="outputs/seg/best_model.pt",
+                )
+                seg_kwargs["checkpoint"] = ck or None
+            elif seg_method == "hailo":
+                hef = st.text_input(
+                    "Compiled HEF path (.hef)", value="outputs/seg/model.hef"
+                )
+                seg_kwargs["hef_path"] = hef or None
+            if seg_method in {"deeplab", "finetuned"}:
+                seg_kwargs["device"] = st.selectbox(
+                    "Torch device", ["cpu", "cuda"], index=0
+                )
+
+        raw_masks, angles = [], []
+        session = CaptureSession(
+            frames=[
+                np.array(
+                    Image.fromarray(frame).resize(
+                        (bg.shape[1], bg.shape[0]), Image.LANCZOS
+                    )
+                )
+                if frame.shape != bg.shape
+                else frame
+                for frame in st.session_state.cap_frames
+            ],
+            angles_deg=list(st.session_state.cap_angles),
+            background=bg,
+        )
+        try:
+            masks = extract_silhouettes(session, method=seg_method, **seg_kwargs)
+        except Exception as exc:
+            st.error(f"Segmentation failed ({seg_method}): {exc}")
+            st.stop()
+        raw_masks = list(masks)
+        angles = list(session.angles_deg)
+
+        st.success(
+            f"Using live capture session: {len(raw_masks)} views "
+            f"(segmentation: {seg_method})."
+        )
         strip_n = min(6, len(raw_masks))
         strip   = np.concatenate(
             [raw_masks[i].astype(np.uint8) * 255 for i in range(strip_n)], axis=1
