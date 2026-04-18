@@ -2,6 +2,8 @@
 # Edit at https://www.toptal.com/developers/gitignore?templates=windows,linux,macos,python,react,visualstudiocode,visualstudio
 
 *sync-conflict*
+Technical_Ford_Grasping.pdf
+*.xlsx
 
 
 ### Linux ###
