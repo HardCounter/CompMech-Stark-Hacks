@@ -14,7 +14,8 @@ Phase 2: Core Middleware & Kinematics (ROS 2 + MoveIt)
 
 Phase 3: Building & Optimizing the Vision Pipeline
 
-    Develop the Silhouette Extractor: Program a Convolutional Neural Network (CNN) to semantically segment the target transparent object from the background based solely on RGB color data, circumventing the depth sensor "invisible object" problem.
+    Develop the Silhouette Extractor:
+    Program a Convolutional Neural Network (CNN) to semantically segment the target transparent object from the background based solely on RGB color data, circumventing the depth sensor "invisible object" problem.
 
     Apply TensorRT Acceleration: Export your trained vision model to ONNX, and then compile it using NVIDIA TensorRT. This step is mandatory for achieving high frame rates (e.g., jumping from 30 FPS to 90 FPS) by mathematically merging neural network layers and using mixed precision.
 
