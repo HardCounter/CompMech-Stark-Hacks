@@ -20,8 +20,6 @@ Examples:
 
 import argparse
 
-from gripper_cv.heapgrasp.pipeline import run_pipeline
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -36,7 +34,7 @@ def main() -> None:
              "'hailo' runs on the Hailo-8L NPU — requires --hef-path.",
     )
     parser.add_argument("--volume", type=int, default=64, metavar="V",
-                        help="Voxel grid resolution V (V³ voxels, default: 64)")
+                        help="Voxel grid resolution V (V^3 voxels, default: 64)")
     parser.add_argument("--object-diameter", type=float, default=0.15, metavar="M",
                         help="Reconstruction volume side in metres (default: 0.15)")
     parser.add_argument("--camera-distance", type=float, default=0.40, metavar="M",
@@ -67,7 +65,7 @@ def main() -> None:
                         help="Number of additional views suggested by the NBV planner (default: 4).")
     parser.add_argument("--hef-path", type=str, default=None, metavar="PATH",
                         help="Path to compiled .hef model for Hailo-8L NPU (enables method='hailo'). "
-                             "Compile with: gripper-cv-export-onnx → hailo optimize → hailo compile")
+                             "Compile with: gripper-cv-export-onnx -> hailo optimize -> hailo compile")
     parser.add_argument("--seg-img-size", type=int, nargs=2, default=[512, 512],
                         metavar=("H", "W"),
                         help="Image size the Hailo model was compiled for (default: 512 512).")
@@ -81,8 +79,18 @@ def main() -> None:
     parser.add_argument("--grasp-hef", type=str, default=None, metavar="PATH",
                         help="Optional compiled .hef for running the grasp scorer "
                              "on the Hailo-8L NPU.")
+    parser.add_argument("--grasp-preset",
+                        choices=["auto", "default", "gqcnn2"],
+                        default="auto",
+                        help="Grasp model convention. 'auto' reads ONNX metadata, "
+                             "'gqcnn2' forces Dex-Net 2.0 GQ-CNN 2.0 input "
+                             "(32x32 metric depth + pose scalar). Default: auto.")
 
     args = parser.parse_args()
+
+    # Import lazily so `--help` works on machines without picamera2 installed.
+    from gripper_cv.heapgrasp.pipeline import run_pipeline
+
     run_pipeline(
         n_views=args.n_views,
         segment_method=args.segment,
@@ -106,6 +114,7 @@ def main() -> None:
         top_k_grasps=args.top_k_grasps,
         grasp_onnx_path=args.grasp_onnx,
         grasp_hef_path=args.grasp_hef,
+        grasp_preset=args.grasp_preset,
     )
 
 

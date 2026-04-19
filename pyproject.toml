@@ -31,8 +31,17 @@ dashboard = [
 hailo = [
     "hailort",
 ]
+dexnet = [
+    # Export Berkeley's TF1 Dex-Net 2.0 / GQ-CNN 2.0 checkpoints to ONNX.
+    # tensorflow==1.15 is pinned by tf2onnx's TF1 path.
+    "tf2onnx>=1.14",
+    "onnx>=1.15",
+    "onnxruntime>=1.17",
+]
 dev = [
     "pytest>=8.0",
+    "onnx>=1.15",
+    "onnxruntime>=1.17",
 ]
 
 [tool.pytest.ini_options]

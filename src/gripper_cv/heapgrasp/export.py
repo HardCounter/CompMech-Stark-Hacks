@@ -52,7 +52,7 @@ def save_voxels_npy(voxels: np.ndarray, path: str | Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     np.save(path, voxels)
-    print(f"Saved voxel grid {voxels.shape} → {path}")
+    print(f"Saved voxel grid {voxels.shape} -> {path}")
 
 
 def save_grasps_json(payload: dict, path: str | Path) -> None:
@@ -61,4 +61,4 @@ def save_grasps_json(payload: dict, path: str | Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
-    print(f"Saved {len(payload.get('grasps', []))} grasps → {path}")
+    print(f"Saved {len(payload.get('grasps', []))} grasps -> {path}")

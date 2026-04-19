@@ -39,6 +39,7 @@ def run_pipeline(
     top_k_grasps: int = 5,
     grasp_onnx_path: str | None = None,
     grasp_hef_path: str | None = None,
+    grasp_preset: str = "auto",
 ) -> None:
     """
     Run the full HEAPGrasp pipeline.
@@ -66,6 +67,8 @@ def run_pipeline(
         top_k_grasps:     number of grasps to export (ranked by score, highest first)
         grasp_onnx_path:  optional ONNX model for a learned grasp quality scorer
         grasp_hef_path:   optional .hef for running the grasp scorer on the Hailo-8L
+        grasp_preset:     "auto" (read ONNX metadata), "default", or "gqcnn2"
+                          (forces Dex-Net 2.0 GQ-CNN conventions)
     """
     out = Path(output_dir)
 
@@ -190,9 +193,13 @@ def run_pipeline(
         if grasp_hef_path or grasp_onnx_path:
             scorer = LearnedGraspScorer(
                 onnx_path=grasp_onnx_path, hef_path=grasp_hef_path,
+                preset=grasp_preset,  # type: ignore[arg-type]
             )
             score_fn = scorer.score_fn
-            print(f"  [grasp] scorer backend: {scorer.backend}")
+            print(
+                f"  [grasp] scorer backend: {scorer.backend}  "
+                f"preset: {scorer.preset}  encoding: {scorer.encoding}"
+            )
         try:
             grasps = grasp_from_voxels(
                 voxels, object_diameter,

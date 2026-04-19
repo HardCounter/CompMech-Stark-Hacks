@@ -19,7 +19,7 @@ from .grasp import (
     pca_grasp,
     sample_grasps,
 )
-from .grasp_learned import LearnedGraspScorer, render_grasp_patch
+from .grasp_learned import LearnedGraspScorer, PatchRender, render_grasp_patch
 
 __all__ = [
     "run_pipeline",
@@ -31,6 +31,7 @@ __all__ = [
     "grasps_to_json",
     "format_grasp_plan",
     "LearnedGraspScorer",
+    "PatchRender",
     "render_grasp_patch",
 ]
 

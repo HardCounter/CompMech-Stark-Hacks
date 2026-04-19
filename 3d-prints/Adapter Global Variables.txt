@@ -1,6 +1,0 @@
-﻿"M6 Screw"= 5mm
-"Flange to Part A"= 90mm
-"Part A to Part b"= 120mm
-"Part B to Part C"= 120
-"Part B Screw to Wall"= 5mm
-"Heat Set Insert Diameter"= 8mm
