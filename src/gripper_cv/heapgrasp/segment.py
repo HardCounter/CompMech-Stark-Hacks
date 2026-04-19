@@ -31,16 +31,117 @@ from .capture import CaptureSession
 
 
 # ---------------------------------------------------------------------------
+# Shadow removal (CIE Lab chromatic shadow detector)
+# ---------------------------------------------------------------------------
+
+def remove_shadows(
+    mask: np.ndarray,
+    frame_rgb: np.ndarray,
+    background_rgb: np.ndarray,
+    darkness: float = 0.20,
+    chroma_tol: float = 14.0,
+) -> np.ndarray:
+    """
+    Remove shadow pixels from a background-subtraction mask.
+
+    Shadows are darker than the background but share the same chrominance
+    (they reduce only brightness, not hue or saturation). The detector
+    operates in CIE Lab space where lightness (L) and chrominance (a*, b*)
+    are independent:
+
+      shadow  → L drops significantly, |Δa*| and |Δb*| stay small
+      object  → L may drop or rise, but a*/b* differ OR L drop is minimal
+
+    Parameters
+    ----------
+    mask            : (H, W) bool foreground mask from absdiff
+    frame_rgb       : (H, W, 3) uint8 RGB current frame
+    background_rgb  : (H, W, 3) uint8 RGB background frame
+    darkness        : fraction of L* range [0,100] that must drop to
+                      qualify as a shadow. 0.20 = at least 20 L* units
+                      darker.  Raise for stricter (only deep shadows);
+                      lower for aggressive removal.
+    chroma_tol      : max |Δa*| and |Δb*| allowed for a shadow pixel.
+                      Smaller = stricter (fewer pixels removed).
+
+    Returns
+    -------
+    (H, W) bool mask with shadow pixels zeroed out.
+    """
+    # Use float32 [0,1] so cvtColor gives Lab in standard range:
+    # L in [0, 100], a* and b* in [-127, 127]
+    frame_f = frame_rgb.astype(np.float32) / 255.0
+    bg_f    = background_rgb.astype(np.float32) / 255.0
+
+    frame_lab = cv2.cvtColor(frame_f, cv2.COLOR_RGB2Lab)
+    bg_lab    = cv2.cvtColor(bg_f,    cv2.COLOR_RGB2Lab)
+
+    L_drop = bg_lab[..., 0] - frame_lab[..., 0]          # positive = darker
+    da     = np.abs(frame_lab[..., 1] - bg_lab[..., 1])
+    db     = np.abs(frame_lab[..., 2] - bg_lab[..., 2])
+
+    shadow = (
+        (L_drop > darkness * 100.0) &   # significantly darker
+        (da < chroma_tol) &              # same hue
+        (db < chroma_tol)
+    )
+
+    cleaned = (mask & ~shadow).astype(np.uint8) * 255
+
+    # Re-close small holes left by shadow removal (e.g. shadow under object)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
+    return cleaned > 0
+
+
+# ---------------------------------------------------------------------------
+# Contrast enhancement (CLAHE on Lab L-channel)
+# ---------------------------------------------------------------------------
+
+def _apply_clahe(img_rgb: np.ndarray, clip_limit: float = 2.0) -> np.ndarray:
+    """
+    Apply CLAHE to the luminance channel (Lab space) of an RGB image.
+
+    Equalises local brightness without shifting colours — useful when the
+    object blends into the background under flat or uneven lighting.
+    """
+    lab = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2Lab)
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(8, 8))
+    lab[..., 0] = clahe.apply(lab[..., 0])
+    return cv2.cvtColor(lab, cv2.COLOR_Lab2RGB)
+
+
+# ---------------------------------------------------------------------------
 # Background subtraction
 # ---------------------------------------------------------------------------
 
-def _bg_subtract(frame_rgb: np.ndarray, background_rgb: np.ndarray, threshold: int) -> np.ndarray:
+def _bg_subtract(
+    frame_rgb: np.ndarray,
+    background_rgb: np.ndarray,
+    threshold: int,
+    shadow_removal: bool = True,
+    shadow_darkness: float = 0.20,
+    shadow_chroma_tol: float = 14.0,
+    contrast_enhance: bool = False,
+    clahe_clip: float = 2.0,
+) -> np.ndarray:
+    if contrast_enhance:
+        frame_rgb      = _apply_clahe(frame_rgb,      clahe_clip)
+        background_rgb = _apply_clahe(background_rgb, clahe_clip)
     diff = cv2.absdiff(frame_rgb, background_rgb).mean(axis=2)
     mask = (diff > threshold).astype(np.uint8) * 255
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-    return mask > 0
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
+    mask = mask > 0
+
+    if shadow_removal:
+        mask = remove_shadows(
+            mask, frame_rgb, background_rgb,
+            darkness=shadow_darkness,
+            chroma_tol=shadow_chroma_tol,
+        )
+    return mask
 
 
 # ---------------------------------------------------------------------------
@@ -169,18 +270,28 @@ def extract_silhouettes(
     checkpoint: str | None = None,
     hef_path: str | None = None,
     img_size: tuple = (512, 512),
+    shadow_removal: bool = True,
+    shadow_darkness: float = 0.20,
+    shadow_chroma_tol: float = 14.0,
+    contrast_enhance: bool = False,
+    clahe_clip: float = 2.0,
 ) -> List[np.ndarray]:
     """
     Return a list of binary silhouette masks (H, W) bool, one per view.
 
     Args:
-        session:       CaptureSession from capture_multiview()
-        method:        "background", "deeplab", "finetuned", or "hailo"
-        device:        torch device string (for deeplab / finetuned)
-        bg_threshold:  pixel difference threshold (for background method)
-        checkpoint:    path to .pt checkpoint (required for method="finetuned")
-        hef_path:      path to compiled .hef model (required for method="hailo")
-        img_size:      (H, W) the model was compiled for (hailo only)
+        session:            CaptureSession from capture_multiview()
+        method:             "background", "deeplab", "finetuned", or "hailo"
+        device:             torch device string (for deeplab / finetuned)
+        bg_threshold:       pixel difference threshold (for background method)
+        checkpoint:         path to .pt checkpoint (required for method="finetuned")
+        hef_path:           path to compiled .hef model (required for method="hailo")
+        img_size:           (H, W) the model was compiled for (hailo only)
+        shadow_removal:     if True, remove shadow pixels from background-subtraction masks
+        shadow_darkness:    min L* drop (fraction of 100) to classify a pixel as shadow
+        shadow_chroma_tol:  max |Δa*| / |Δb*| to classify a pixel as shadow
+        contrast_enhance:   if True, apply CLAHE to frames before diffing
+        clahe_clip:         CLAHE clip limit (higher = stronger contrast boost)
     """
     masks: List[np.ndarray] = []
 
@@ -188,7 +299,14 @@ def extract_silhouettes(
         if session.background is None:
             raise ValueError("Background frame missing. Re-run capture with object removed first.")
         for i, frame in enumerate(session.frames):
-            masks.append(_bg_subtract(frame, session.background, bg_threshold))
+            masks.append(_bg_subtract(
+                frame, session.background, bg_threshold,
+                shadow_removal=shadow_removal,
+                shadow_darkness=shadow_darkness,
+                shadow_chroma_tol=shadow_chroma_tol,
+                contrast_enhance=contrast_enhance,
+                clahe_clip=clahe_clip,
+            ))
             print(f"  Segmented view {i+1}/{len(session.frames)} (background subtraction)")
 
     elif method == "deeplab":

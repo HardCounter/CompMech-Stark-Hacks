@@ -33,16 +33,18 @@ def run_pipeline(
     n_planner_views: int = 4,
     hef_path: str | None = None,
     seg_img_size: tuple = (512, 512),
+    theta_deg: float = 90.0,
+    thetas_deg: list | None = None,
 ) -> None:
     """
     Run the full HEAPGrasp pipeline.
 
     Args:
-        n_views:          number of turntable views (evenly spaced, 360/n_views deg apart)
+        n_views:          number of views (evenly spaced azimuthally, 360/n_views deg apart)
         segment_method:   "background", "deeplab", "finetuned", or "hailo"
         volume_size:      voxel grid resolution (volume_size³ voxels)
         object_diameter:  manual reconstruction volume side length in metres
-        camera_distance:  manual camera-to-object-centre distance in metres
+        camera_distance:  hemisphere radius in metres
         fov_deg:          camera horizontal FOV (Pi Cam Module 3 ≈ 66°, v2 ≈ 62.2°)
         bg_threshold:     background subtraction sensitivity (lower = more sensitive)
         output_dir:       directory for all outputs
@@ -55,6 +57,11 @@ def run_pipeline(
         n_planner_views:  number of additional view angles the planner suggests
         hef_path:         path to compiled .hef for Hailo-8L NPU (method="hailo")
         seg_img_size:     (H, W) the Hailo model was compiled for (hailo method only)
+        theta_deg:        polar angle from zenith for all views (degrees).
+                          90 = horizontal side view (legacy turntable).
+                          HEAPGrasp hand-eye uses ~36° (π/5 rad).
+        thetas_deg:       per-view polar angles (degrees); overrides theta_deg if given.
+                          Use this when the robot arm provides exact viewpoint poses.
     """
     out = Path(output_dir)
 
@@ -114,6 +121,29 @@ def run_pipeline(
     )
     save_masks(masks, out / "masks")
 
+    # ── 2c. Mask quality check ────────────────────────────────────────────
+    fill_ratios = [m.mean() for m in masks]
+    for i, r in enumerate(fill_ratios):
+        print(f"  Mask {i+1}: {r*100:.1f}% foreground")
+
+    empty = [i for i, r in enumerate(fill_ratios) if r < 0.005]
+    if len(empty) == len(masks):
+        raise RuntimeError(
+            "\nAll silhouette masks are empty (<0.5% foreground).\n"
+            "Most likely cause: the BACKGROUND was captured WITH the object in place,\n"
+            "so every view looks identical to the background → nothing detected.\n"
+            "Fix: re-run and make sure the object is fully removed before pressing\n"
+            "SPACE for the background frame.\n"
+            "Check outputs/heapgrasp/masks/ to inspect the masks visually."
+        )
+    if len(empty) > len(masks) // 2:
+        print(
+            f"  WARNING: {len(empty)}/{len(masks)} masks are nearly empty — "
+            "reconstruction quality will be poor.\n"
+            "  Likely cause: lighting changed between background and object captures,\n"
+            "  or the object blends with the background. Try a contrasting backdrop."
+        )
+
     # ── 2b. Auto-calibrate: object diameter from silhouette bounding boxes ─
     if auto_scale:
         object_diameter = estimate_object_diameter(
@@ -128,7 +158,15 @@ def run_pipeline(
     print(f"\n  camera_distance = {camera_distance:.3f} m  |  object_diameter = {object_diameter:.3f} m")
 
     # ── 3. Reconstruct ────────────────────────────────────────────────────
+    import math as _math
+    n_v = len(session.angles_deg)
+    if thetas_deg is not None:
+        thetas_rad_list = [_math.radians(t) for t in thetas_deg]
+    else:
+        thetas_rad_list = [_math.radians(theta_deg)] * n_v
+
     print(f"\nShape from Silhouette ({volume_size}³ voxels)…")
+    print(f"  Camera polar angle θ: {theta_deg:.1f}° from zenith")
     voxels = shape_from_silhouette(
         silhouettes=masks,
         angles_deg=session.angles_deg,
@@ -136,6 +174,7 @@ def run_pipeline(
         volume_size=volume_size,
         object_diameter=object_diameter,
         camera_distance=camera_distance,
+        thetas_rad=thetas_rad_list,
     )
 
     n_occ = int(voxels.sum())

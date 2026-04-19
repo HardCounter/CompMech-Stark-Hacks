@@ -35,12 +35,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from gripper_cv.hailo import is_hailo_available
 from gripper_cv.heapgrasp.capture import CaptureSession
+from gripper_cv.heapgrasp.grasp import GraspCandidate, find_grasps
 from gripper_cv.heapgrasp.reconstruct import (
     default_camera_matrix,
+    estimate_grid_center,
+    reproject_hull,
     shape_from_silhouette,
     voxels_to_pointcloud,
 )
-from gripper_cv.heapgrasp.segment import extract_silhouettes
+from gripper_cv.heapgrasp.segment import _apply_clahe, extract_silhouettes, remove_shadows
 from gripper_cv.planner import NextBestViewPlanner
 from gripper_cv.sim2real.domain_rand import DomainRandomTransform
 
@@ -104,6 +107,9 @@ if "cap_bg" not in st.session_state:
     st.session_state.cap_frames: List[np.ndarray] = []
     st.session_state.cap_angles: List[float] = []
     st.session_state.cap_n_views: int = 8
+    # Polar angle θ from zenith at which all views were captured.
+    # 90° = horizontal side view (turntable), 36° ≈ π/5 = HEAPGrasp hand-eye.
+    st.session_state.cap_theta_deg: float = 90.0
 
 # ---------------------------------------------------------------------------
 # Sidebar
@@ -172,6 +178,12 @@ def _pi_capture_ui(
     label: str,
     key_prefix: str,
     background: Optional[np.ndarray] = None,
+    contrast_enhance: bool = False,
+    clahe_clip: float = 2.0,
+    shadow_removal: bool = True,
+    shadow_darkness: float = 0.20,
+    shadow_chroma_tol: float = 14.0,
+    bg_threshold: int = 30,
 ) -> Optional[np.ndarray]:
     """
     Unified camera-capture widget.
@@ -184,6 +196,20 @@ def _pi_capture_ui(
     """
     preview_key = f"_prev_{key_prefix}"
     cam = _open_pi_camera()
+
+    def _processed_diff(frm: np.ndarray, bg: np.ndarray) -> np.ndarray:
+        """Return a uint8 grayscale diff after contrast boost + shadow removal."""
+        f = _apply_clahe(frm, clahe_clip) if contrast_enhance else frm
+        b = _apply_clahe(bg,  clahe_clip) if contrast_enhance else bg
+        diff = np.abs(f.astype(np.int16) - b.astype(np.int16)).mean(2).astype(np.uint8)
+        if shadow_removal:
+            # Zero out pixels that are classified as shadows so they appear dark.
+            shad = remove_shadows(
+                diff > bg_threshold, frm, bg,
+                darkness=shadow_darkness, chroma_tol=shadow_chroma_tol,
+            )
+            diff = (diff * shad.astype(np.uint8))
+        return diff
 
     if cam is not None:
         # ── Pi camera path ────────────────────────────────────────────
@@ -212,9 +238,8 @@ def _pi_capture_ui(
                 prev_c.image(frame,
                              caption="Preview — click 'Use this frame' to confirm",
                              use_container_width=True)
-                diff = np.abs(frame.astype(np.int16) - background.astype(np.int16)) \
-                         .mean(2).astype(np.uint8)
-                diff_c.image(diff, caption="Difference from background",
+                diff_c.image(_processed_diff(frame, background),
+                             caption="Difference from background (processed)",
                              use_container_width=True, clamp=True)
             else:
                 st.image(frame, caption="Preview — click 'Use this frame' to confirm",
@@ -241,9 +266,9 @@ def _pi_capture_ui(
                 if frame.shape == background.shape:
                     prev_c, diff_c = st.columns(2)
                     prev_c.image(frame, caption="Captured", use_container_width=True)
-                    diff = np.abs(frame.astype(np.int16) - background.astype(np.int16)) \
-                             .mean(2).astype(np.uint8)
-                    diff_c.image(diff, caption="Difference", use_container_width=True, clamp=True)
+                    diff_c.image(_processed_diff(frame, background),
+                                 caption="Difference from background (processed)",
+                                 use_container_width=True, clamp=True)
             if st.button("✅ Use this frame", key=f"btn_use_{key_prefix}",
                          type="primary", use_container_width=True):
                 return st.session_state.pop(preview_key)
@@ -255,19 +280,95 @@ def _pi_capture_ui(
 # Shared helpers
 # ---------------------------------------------------------------------------
 
+def _make_shape_masks(
+    shape_type: str,
+    angles: list,
+    H: int, W: int,
+    cx: int, cy: int,
+    fx_syn: float,
+    cam_dist: float,
+    r_m: float,
+    theta_rad: float = np.pi / 2,
+) -> list:
+    """
+    Generate synthetic 2D silhouette masks by projecting a 3D voxel shape at
+    each viewpoint using the full hemispherical camera model from reconstruct.py.
+
+    theta_rad: polar angle from zenith (pi/2 = horizontal side view).
+    shape_type: "brick" | "L" | "torus"
+    """
+    from gripper_cv.heapgrasp.reconstruct import _view_transform
+
+    V = 40
+    lin = np.linspace(-1.0, 1.0, V)
+    xi, yi, zi = np.meshgrid(lin, lin, lin, indexing='ij')
+
+    if shape_type == "brick":
+        occ = (np.abs(xi) <= 0.90) & (np.abs(yi) <= 0.65) & (np.abs(zi) <= 0.45)
+    elif shape_type == "L":
+        arm_h = (np.abs(xi) <= 0.90) & (np.abs(zi) <= 0.28) & (np.abs(yi) <= 0.65)
+        arm_v = (xi >= 0.45) & (np.abs(zi) <= 0.90) & (np.abs(yi) <= 0.65)
+        occ = arm_h | arm_v
+    elif shape_type == "torus":
+        # Ring standing upright in XY plane (hole along Z).
+        # At theta=pi/2, 0° looks like a ring; at 90° collapses to a rectangle.
+        r_maj, r_min = 0.62, 0.33
+        dist = np.sqrt((np.sqrt(xi**2 + yi**2) - r_maj)**2 + zi**2)
+        occ = dist <= r_min
+    else:
+        raise ValueError(f"Unknown shape_type: {shape_type!r}")
+
+    ix, iy, iz = np.where(occ)
+    X = lin[ix] * r_m
+    Y = lin[iy] * r_m
+    Z = lin[iz] * r_m
+    pts = np.stack([X, Y, Z], axis=0)  # (3, N)
+
+    K_syn = np.array([[fx_syn, 0, cx], [0, fx_syn, cy], [0, 0, 1]], dtype=np.float64)
+
+    masks_out = []
+    for a in angles:
+        R, C = _view_transform(a, theta_rad, cam_dist)
+        pts_cam = R @ (pts - C[:, None])  # (3, N)
+        depth = pts_cam[2]
+
+        proj = K_syn @ pts_cam
+        u = np.round(proj[0] / (depth + 1e-9)).astype(int)
+        v = np.round(proj[1] / (depth + 1e-9)).astype(int)
+
+        mask = np.zeros((H, W), dtype=bool)
+        valid = (depth > 0) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+        uv, vv = u[valid], v[valid]
+
+        for uc in np.unique(uv):
+            rows = vv[uv == uc]
+            mask[rows.min():rows.max() + 1, uc] = True
+
+        masks_out.append(mask)
+
+    return masks_out
+
+
 @st.cache_data(show_spinner=False)
 def _run_sfs(
     masks_bytes: Tuple[bytes, ...],
     shapes: Tuple[Tuple[int, int], ...],
     angles: Tuple[float, ...],
     V: int, diameter: float, cam_dist: float, fov: float,
-) -> np.ndarray:
+    theta_rad: float = np.pi / 2,
+) -> Tuple[np.ndarray, np.ndarray]:
     masks = [np.frombuffer(b, np.uint8).reshape(s).astype(bool)
              for b, s in zip(masks_bytes, shapes)]
-    K = default_camera_matrix(640, 480, fov_deg=fov)
-    return shape_from_silhouette(masks, list(angles), K,
-                                 volume_size=V, object_diameter=diameter,
-                                 camera_distance=cam_dist)
+    H, W = shapes[0] if shapes else (480, 640)
+    K = default_camera_matrix(W, H, fov_deg=fov)
+    thetas = [theta_rad] * len(masks)
+    center = estimate_grid_center(masks, K, cam_dist,
+                                  thetas_rad=thetas, angles_deg=list(angles))
+    voxels = shape_from_silhouette(masks, list(angles), K,
+                                   volume_size=V, object_diameter=diameter,
+                                   camera_distance=cam_dist, grid_center=center,
+                                   thetas_rad=thetas)
+    return voxels, center
 
 
 def _overlay_mask(img: np.ndarray, mask: np.ndarray,
@@ -286,8 +387,8 @@ def _pca(pts: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     return centroid, eigvals[order], eigvecs[:, order]
 
 
-def _ply_bytes(voxels: np.ndarray, diameter: float) -> bytes:
-    pts = voxels_to_pointcloud(voxels, diameter)
+def _ply_bytes(voxels: np.ndarray, diameter: float, grid_center: np.ndarray | None = None) -> bytes:
+    pts = voxels_to_pointcloud(voxels, diameter, grid_center)
     buf = io.BytesIO()
     buf.write(b"ply\nformat ascii 1.0\n")
     buf.write(f"element vertex {len(pts)}\n".encode())
@@ -306,6 +407,7 @@ def generate_grasp_plan(
     diameter: float,
     cam_dist: float,
     n_views: int,
+    grid_center: np.ndarray | None = None,
 ) -> str:
     """
     Generate a natural-language arm movement plan from a reconstructed voxel grid.
@@ -315,7 +417,7 @@ def generate_grasp_plan(
       Y  →  up in camera frame     (positive = translate gripper up)
       Z  →  forward (optical axis) (approach direction)
     """
-    pts = voxels_to_pointcloud(voxels, diameter)
+    pts = voxels_to_pointcloud(voxels, diameter, grid_center)
     if len(pts) < 8:
         return ("⚠  Insufficient point cloud data.\n"
                 "Capture more views for a reliable grasp plan.")
@@ -471,10 +573,12 @@ def _make_scan_figure(
     nbv_angles: Optional[List[float]] = None,
     show_grasp: bool = True,
     max_pts: int = 8000,
+    grid_center: np.ndarray | None = None,
+    grasps: Optional[List[GraspCandidate]] = None,
 ):
     import plotly.graph_objects as go
 
-    pts = voxels_to_pointcloud(voxels, diameter)
+    pts = voxels_to_pointcloud(voxels, diameter, grid_center)
     if len(pts) == 0:
         return go.Figure()
 
@@ -513,38 +617,41 @@ def _make_scan_figure(
                 name=ax_labels[i],
             ))
 
-        if show_grasp:
-            grasp_ax = eigvecs[:, 2]
-            jaw_ax   = eigvecs[:, 0]
-            c1 = centroid + grasp_ax * spans[2]
-            c2 = centroid - grasp_ax * spans[2]
-            jaw_w = spans[0] * 0.6
+        if show_grasp and grasps:
+            grasp_colors = ["#22c55e", "#fbbf24", "#f97316", "#a78bfa", "#60a5fa"]
+            for rank, g in enumerate(grasps):
+                col = grasp_colors[rank % len(grasp_colors)]
+                label_prefix = f"#{rank+1} (score {g.score:.2f})"
 
-            for contact, label in [(c1, "Jaw A"), (c2, "Jaw B")]:
-                j1 = contact - jaw_ax * jaw_w
-                j2 = contact + jaw_ax * jaw_w
+                # Line between contacts = jaw opening
                 traces.append(go.Scatter3d(
-                    x=[j1[0], j2[0]], y=[j1[2], j2[2]], z=[j1[1], j2[1]],
-                    mode="lines",
-                    line=dict(color="#fbbf24", width=7),
-                    name=label,
+                    x=[g.contact_1[0], g.contact_2[0]],
+                    y=[g.contact_1[2], g.contact_2[2]],
+                    z=[g.contact_1[1], g.contact_2[1]],
+                    mode="lines+markers",
+                    line=dict(color=col, width=6),
+                    marker=dict(size=6, color=col, symbol="circle"),
+                    name=f"Grasp {label_prefix}",
                 ))
 
-            for contact, direction in [(c1, grasp_ax), (c2, -grasp_ax)]:
-                tip = contact + direction * 0.025
+                # Approach arrow: centre → centre + approach_dir * 0.04
+                arr_end = g.center + g.approach_dir * 0.04
                 traces.append(go.Scatter3d(
-                    x=[tip[0], contact[0]], y=[tip[2], contact[2]], z=[tip[1], contact[1]],
+                    x=[g.center[0], arr_end[0]],
+                    y=[g.center[2], arr_end[2]],
+                    z=[g.center[1], arr_end[1]],
                     mode="lines",
-                    line=dict(color="#fbbf24", width=3, dash="dot"),
+                    line=dict(color=col, width=3, dash="dot"),
                     showlegend=False,
                 ))
 
-            traces.append(go.Scatter3d(
-                x=[centroid[0]], y=[centroid[2]], z=[centroid[1]],
-                mode="markers",
-                marker=dict(size=9, symbol="cross", color="#fbbf24"),
-                name="Grasp centre",
-            ))
+                # TCP centre marker
+                traces.append(go.Scatter3d(
+                    x=[g.center[0]], y=[g.center[2]], z=[g.center[1]],
+                    mode="markers",
+                    marker=dict(size=7, symbol="cross", color=col),
+                    showlegend=False,
+                ))
 
     ring_t = np.linspace(0, 2 * np.pi, 128)
     traces.append(go.Scatter3d(
@@ -669,10 +776,11 @@ if page == "🏠 Overview":
 # ===========================================================================
 
 elif page == "🎬 Live Capture":
-    st.title("🎬 Live Capture — Guided Turntable Session")
+    st.title("🎬 Live Capture — Guided Session")
     st.markdown(
-        "Mount the Pi camera at the gripper tip and point it at the turntable. "
-        "Follow the steps below to capture the background and N object views."
+        "Mount the camera at the gripper tip and point it at the object. "
+        "The arm sweeps around the object on a hemisphere — set the **polar angle θ** "
+        "below to match how your rig is positioned, then capture background + N views."
     )
 
     # Camera status banner
@@ -697,7 +805,7 @@ elif page == "🎬 Live Capture":
     st.markdown("---")
 
     # Per-session settings
-    cfg_col1, cfg_col2, cfg_col3 = st.columns([1, 1, 2])
+    cfg_col1, cfg_col2, cfg_col3, cfg_col4 = st.columns([1, 1, 2, 2])
     with cfg_col1:
         n_views = st.number_input("Views", min_value=4, max_value=24,
                                   value=st.session_state.cap_n_views, step=1)
@@ -706,14 +814,30 @@ elif page == "🎬 Live Capture":
         step_deg = 360.0 / n_views
         st.metric("Step per rotation", f"{step_deg:.1f}°")
     with cfg_col3:
+        theta_input = st.slider(
+            "Camera polar angle θ from zenith",
+            min_value=0, max_value=90,
+            value=int(round(st.session_state.cap_theta_deg)),
+            help=(
+                "**90°** = camera at the same height as the object, looking horizontally "
+                "(classic turntable setup).\n\n"
+                "**36° (π/5)** = HEAPGrasp hand-eye default — arm holds camera above "
+                "and slightly in front, looking down.\n\n"
+                "**0°** = camera directly above, looking straight down."
+            ),
+        )
+        st.session_state.cap_theta_deg = float(theta_input)
+        st.caption(f"θ = {theta_input}° = {np.radians(theta_input):.3f} rad — "
+                   f"camera is {90 - theta_input}° above horizontal")
+    with cfg_col4:
         if st.button("🗑️ Reset session", use_container_width=True):
-            # clear all _prev_ keys too
             for k in list(st.session_state.keys()):
                 if k.startswith("_prev_"):
                     del st.session_state[k]
-            st.session_state.cap_bg     = None
-            st.session_state.cap_frames = []
-            st.session_state.cap_angles = []
+            st.session_state.cap_bg       = None
+            st.session_state.cap_frames   = []
+            st.session_state.cap_angles   = []
+            st.session_state.cap_theta_deg = 90.0
             st.rerun()
 
     n_done = len(st.session_state.cap_frames)
@@ -722,6 +846,36 @@ elif page == "🎬 Live Capture":
     steps_done  = (1 if has_bg else 0) + n_done
     st.progress(steps_done / total_steps,
                 text=f"Step {steps_done} / {total_steps} complete")
+
+    with st.expander("✨ Preview contrast & shadow settings", expanded=False):
+        cap_con, cap_shad = st.columns(2)
+        with cap_con:
+            st.markdown("**Contrast (CLAHE)**")
+            cap_contrast_on  = st.toggle("Enable contrast boost", value=False, key="cap_contrast_on")
+            cap_clahe_clip   = st.slider("CLAHE clip limit", 1.0, 8.0, 2.0, 0.5,
+                                         key="cap_clahe_clip",
+                                         help="Higher = stronger local contrast boost.")
+        with cap_shad:
+            st.markdown("**Shadow removal**")
+            cap_shadow_on    = st.toggle("Enable shadow removal", value=True, key="cap_shadow_on")
+            cs1, cs2, cs3   = st.columns(3)
+            cap_bg_thresh    = cs1.slider("BG threshold", 5, 80, 30, 5, key="cap_bg_thresh")
+            cap_sh_dark      = cs2.slider("Darkness", 0.05, 0.50, 0.20, 0.05,
+                                          key="cap_sh_dark",
+                                          help="Min L* drop to classify as shadow.")
+            cap_sh_chroma    = cs3.slider("Chroma tol.", 2.0, 30.0, 14.0, 1.0,
+                                          key="cap_sh_chroma",
+                                          help="Max |Δa*|/|Δb*| for a shadow pixel.")
+
+    _cap_kwargs = dict(
+        contrast_enhance=cap_contrast_on,
+        clahe_clip=cap_clahe_clip,
+        shadow_removal=cap_shadow_on,
+        shadow_darkness=cap_sh_dark,
+        shadow_chroma_tol=cap_sh_chroma,
+        bg_threshold=cap_bg_thresh,
+    )
+
     st.markdown("---")
 
     # ── Step 1: background ────────────────────────────────────────────
@@ -737,7 +891,7 @@ elif page == "🎬 Live Capture":
                 "Remove the object from the turntable. "
                 "Keep lighting and camera position exactly as during the scan."
             )
-            bg_frame = _pi_capture_ui("Background (no object)", "bg")
+            bg_frame = _pi_capture_ui("Background (no object)", "bg", **_cap_kwargs)
             if bg_frame is not None:
                 st.session_state.cap_bg = bg_frame
                 st.rerun()
@@ -766,6 +920,7 @@ elif page == "🎬 Live Capture":
                         f"View {view_i + 1} at {angle:.0f}°",
                         f"view_{view_i}",
                         background=st.session_state.cap_bg,
+                        **_cap_kwargs,
                     )
                     if frame is not None:
                         bg = st.session_state.cap_bg
@@ -923,13 +1078,38 @@ elif page == "✂️ Segmentation":
 
         threshold = st.slider("Pixel-difference threshold", 5, 80, 30, 5)
 
+        with st.expander("✨ Contrast & shadow removal", expanded=False):
+            con1, con2 = st.columns(2)
+            with con1:
+                st.markdown("**Contrast (CLAHE)**")
+                contrast_on  = st.toggle("Enable contrast boost", value=False, key="seg_contrast_on")
+                clahe_clip_v = st.slider("CLAHE clip limit", 1.0, 8.0, 2.0, 0.5,
+                                         key="seg_clahe_clip",
+                                         help="Higher = stronger local contrast boost. "
+                                              "2–4 is typical; above 6 may introduce artefacts.")
+            with con2:
+                st.markdown("**Shadow removal**")
+                shadow_on  = st.toggle("Enable shadow removal", value=True, key="seg_shadow_on")
+                sh1, sh2   = st.columns(2)
+                sh_dark    = sh1.slider("Darkness", 0.05, 0.50, 0.20, 0.05,
+                                        key="seg_sh_dark",
+                                        help="Min L* drop to flag as shadow.")
+                sh_chroma  = sh2.slider("Chroma tol.", 2.0, 30.0, 14.0, 1.0,
+                                        key="seg_sh_chroma",
+                                        help="Max |Δa*|/|Δb*| for a shadow pixel.")
+
         def _show_seg(bg, obj):
             if bg.shape != obj.shape:
                 obj = np.array(
                     Image.fromarray(obj).resize((bg.shape[1], bg.shape[0]), Image.LANCZOS)
                 )
             sess = CaptureSession(frames=[obj], angles_deg=[0.0], background=bg)
-            mask = extract_silhouettes(sess, method="background", bg_threshold=threshold)[0]
+            mask = extract_silhouettes(
+                sess, method="background", bg_threshold=threshold,
+                shadow_removal=shadow_on, shadow_darkness=sh_dark,
+                shadow_chroma_tol=sh_chroma,
+                contrast_enhance=contrast_on, clahe_clip=clahe_clip_v,
+            )[0]
             c1, c2, c3, c4 = st.columns(4)
             c1.image(bg,  caption="Background",   use_container_width=True)
             c2.image(obj, caption="Object frame",  use_container_width=True)
@@ -997,21 +1177,43 @@ elif page == "✂️ Segmentation":
 elif page == "📦 3D Object Scan":
     st.title("📦 3D Object Scan — Reconstruct & Grasp Plan")
 
-    # ── Parameters ────────────────────────────────────────────────────
-    with st.expander("⚙️ Reconstruction parameters", expanded=False):
+    # ── Camera angle — always visible, pre-populated from capture session ────
+    _default_theta = int(round(st.session_state.get("cap_theta_deg", 90.0)))
+    tc1, tc2 = st.columns([3, 1])
+    with tc1:
+        theta_deg = st.slider(
+            "📐 Camera polar angle θ — degrees from zenith (set this to match how you captured)",
+            min_value=0, max_value=90, value=_default_theta,
+            help=(
+                "**90°** = camera at object height, looking horizontally (turntable rig).\n\n"
+                "**36° (π/5 rad)** = HEAPGrasp hand-eye default — arm above object, "
+                "looking down at ~54° below horizontal.\n\n"
+                "**0°** = camera directly overhead.\n\n"
+                "This value is saved automatically when you use the Live Capture page."
+            ),
+        )
+    with tc2:
+        st.metric("θ in radians", f"{np.radians(theta_deg):.3f}")
+        st.caption(f"{90 - theta_deg}° above horizontal")
+    theta_rad = np.radians(theta_deg)
+
+    # ── Other reconstruction parameters ──────────────────────────────────
+    with st.expander("⚙️ More reconstruction parameters", expanded=False):
         rp1, rp2, rp3, rp4 = st.columns(4)
         V        = rp1.select_slider("Grid V³", [16, 24, 32, 48, 64], value=32)
         diameter = rp2.slider("Object diameter (m)", 0.05, 0.50, 0.15, 0.01)
         cam_dist = rp3.slider("Camera distance (m)", 0.20, 1.00, 0.40, 0.05)
         fov      = rp4.slider("Camera FOV (°)", 40.0, 100.0, 62.2, 0.5)
 
-    K = default_camera_matrix(640, 480, fov_deg=fov)
-
     # ── Input source selection ─────────────────────────────────────────
     n_captured = len(st.session_state.cap_frames)
     has_session = (n_captured >= 4 and st.session_state.cap_bg is not None)
 
-    input_options = ["🔵 Synthetic sphere", "🏺 Synthetic mug", "📁 Upload masks"]
+    input_options = [
+        "🔵 Synthetic sphere", "🏺 Synthetic mug",
+        "🧱 Synthetic brick", "📐 Synthetic L-prism", "🍩 Synthetic torus",
+        "📁 Upload masks",
+    ]
     if has_session:
         input_options.insert(0, f"📷 Live session  ({n_captured} views captured)")
 
@@ -1020,6 +1222,27 @@ elif page == "📦 3D Object Scan":
     # ── Build silhouettes ─────────────────────────────────────────────
     if "Live session" in input_mode:
         bg = st.session_state.cap_bg
+
+        with st.expander("✨ Contrast & shadow removal (live session)", expanded=False):
+            lv_con, lv_shad = st.columns(2)
+            with lv_con:
+                st.markdown("**Contrast (CLAHE)**")
+                live_contrast_on   = st.toggle("Enable contrast boost", value=False, key="live_contrast_on")
+                live_clahe_clip    = st.slider("CLAHE clip limit", 1.0, 8.0, 2.0, 0.5,
+                                               key="live_clahe_clip",
+                                               help="Higher = stronger local contrast boost.")
+            with lv_shad:
+                st.markdown("**Shadow removal**")
+                live_shadow_on     = st.toggle("Enable shadow removal", value=True, key="live_shadow_on")
+                ls1, ls2, ls3      = st.columns(3)
+                live_bg_thresh     = ls1.slider("BG threshold", 5, 80, 30, 5, key="live_bg_thresh")
+                live_sh_dark       = ls2.slider("Darkness", 0.05, 0.50, 0.20, 0.05,
+                                                key="live_sh_dark",
+                                                help="Min L* drop to classify as shadow.")
+                live_sh_chroma     = ls3.slider("Chroma tol.", 2.0, 30.0, 14.0, 1.0,
+                                                key="live_sh_chroma",
+                                                help="Max |Δa*|/|Δb*| for a shadow pixel.")
+
         raw_masks, angles = [], []
         for frame, ang in zip(st.session_state.cap_frames, st.session_state.cap_angles):
             if frame.shape != bg.shape:
@@ -1027,7 +1250,14 @@ elif page == "📦 3D Object Scan":
                     Image.fromarray(frame).resize((bg.shape[1], bg.shape[0]), Image.LANCZOS)
                 )
             sess  = CaptureSession(frames=[frame], angles_deg=[ang], background=bg)
-            mask  = extract_silhouettes(sess, method="background", bg_threshold=30)[0]
+            mask  = extract_silhouettes(
+                sess, method="background", bg_threshold=live_bg_thresh,
+                shadow_removal=live_shadow_on,
+                shadow_darkness=live_sh_dark,
+                shadow_chroma_tol=live_sh_chroma,
+                contrast_enhance=live_contrast_on,
+                clahe_clip=live_clahe_clip,
+            )[0]
             raw_masks.append(mask)
             angles.append(ang)
 
@@ -1054,20 +1284,48 @@ elif page == "📦 3D Object Scan":
         angles      = [i * 360.0 / n_views_syn for i in range(n_views_syn)]
         H, W        = 240, 320
         cy, cx      = H // 2, W // 2
-        raw_masks   = []
+        # Focal length consistent with cam_dist / diameter sliders
+        fx_syn = (W / 2.0) / np.tan(np.radians(fov / 2.0))
+        r_m    = diameter / 2.0
+        r      = max(10, int(round(r_m * fx_syn / cam_dist)))
 
         if "mug" in input_mode:
+            bw = max(8, int(r * 1.2))
+            bh = max(10, int(r * 1.7))
+            raw_masks = []
             for _ in angles:
                 m = np.zeros((H, W), dtype=bool)
-                bw, bh = 80, 110
                 m[cy-bh//2:cy+bh//2, cx-bw//2:cx+bw//2] = True
                 yg, xg = np.ogrid[:H, :W]
-                hcx, hcy = cx + bw//2 + 18, cy + 10
-                m[((yg-hcy)/35)**2 + ((xg-hcx)/20)**2 <= 1] = True
-                m[((yg-hcy)/22)**2 + ((xg-hcx)/8)**2  <= 1] = False
+                hcx, hcy = cx + bw//2 + int(r*0.28), cy + int(r*0.12)
+                handle_a, handle_b = int(r*0.53), int(r*0.30)
+                m[((yg-hcy)/handle_a)**2 + ((xg-hcx)/handle_b)**2 <= 1] = True
+                m[((yg-hcy)/(handle_a*0.63))**2 + ((xg-hcx)/(handle_b*0.4))**2 <= 1] = False
                 raw_masks.append(m)
-        else:
-            r = min(H, W) // 3
+
+        elif "brick" in input_mode:
+            st.caption(
+                "🧱 **Brick** — 2:1 aspect ratio in XZ. Silhouette is widest at 0°/180° "
+                "and narrowest at 90°/270°. Reconstruction should be a flat slab, not a cube."
+            )
+            raw_masks = _make_shape_masks("brick", angles, H, W, cx, cy, fx_syn, cam_dist, r_m, theta_rad)
+
+        elif "L-prism" in input_mode:
+            st.caption(
+                "📐 **L-prism** — L-shaped cross-section. Each view looks different; "
+                "two arms of unequal length give a clearly asymmetric reconstruction."
+            )
+            raw_masks = _make_shape_masks("L", angles, H, W, cx, cy, fx_syn, cam_dist, r_m, theta_rad)
+
+        elif "torus" in input_mode:
+            st.caption(
+                "🍩 **Torus** — ring standing upright. At 0° the silhouette is an annulus; "
+                "at 90° it collapses to a thin rectangle. The most demanding SfS test."
+            )
+            raw_masks = _make_shape_masks("torus", angles, H, W, cx, cy, fx_syn, cam_dist, r_m, theta_rad)
+
+        else:  # sphere
+            raw_masks = []
             for _ in angles:
                 m  = np.zeros((H, W), dtype=bool)
                 yg, xg = np.ogrid[:H, :W]
@@ -1078,18 +1336,21 @@ elif page == "📦 3D Object Scan":
         strip   = np.concatenate(
             [raw_masks[i].astype(np.uint8) * 255 for i in range(strip_n)], axis=1
         )
-        st.image(strip, caption=f"First {strip_n} silhouettes", use_container_width=True)
+        st.image(strip, caption=f"First {strip_n} silhouettes (note how width changes)",
+                 use_container_width=True)
 
     # ── Run SfS ───────────────────────────────────────────────────────
     masks_bytes = tuple(m.astype(np.uint8).tobytes() for m in raw_masks)
     shapes_arg  = tuple(m.shape for m in raw_masks)
+    mask_h, mask_w = raw_masks[0].shape
+    K = default_camera_matrix(mask_w, mask_h, fov_deg=fov)
     with st.spinner(f"Carving {V}³ voxel grid from {len(raw_masks)} views…"):
-        voxels = _run_sfs(masks_bytes, shapes_arg, tuple(angles),
-                          V, diameter, cam_dist, fov)
+        voxels, grid_center = _run_sfs(masks_bytes, shapes_arg, tuple(angles),
+                                       V, diameter, cam_dist, fov, theta_rad)
 
     n_occ  = int(voxels.sum())
     fill   = 100.0 * n_occ / V**3
-    pts_all = voxels_to_pointcloud(voxels, diameter)
+    pts_all = voxels_to_pointcloud(voxels, diameter, grid_center)
 
     mc1, mc2, mc3, mc4 = st.columns(4)
     mc1.metric("Occupied voxels", f"{n_occ:,}")
@@ -1099,6 +1360,77 @@ elif page == "📦 3D Object Scan":
         ext = pts_all.max(0) - pts_all.min(0)
         mc4.metric("Bounding box",
                    f"{ext[0]*100:.1f}×{ext[1]*100:.1f}×{ext[2]*100:.1f} cm")
+
+    st.markdown("---")
+
+    # ── Reprojection Diagnostic ───────────────────────────────────────
+    with st.expander("🔍 Reprojection Diagnostic", expanded=True):
+        st.markdown(
+            "Each tile shows one input silhouette overlaid with the reprojected hull. "
+            "**Green** = hull only (over-carved / mask too small). "
+            "**Blue** = mask only (under-carved). "
+            "**White** = agreement. "
+            "High IoU means the reconstruction is geometrically consistent."
+        )
+
+        thetas_list = [np.radians(theta_deg)] * len(angles)
+        with st.spinner("Reprojecting hull…"):
+            reproj_masks = reproject_hull(
+                voxels, angles,
+                camera_matrix=K,
+                object_diameter=diameter,
+                camera_distance=cam_dist,
+                image_shape=raw_masks[0].shape,
+                thetas_rad=thetas_list,
+                grid_center=grid_center,
+            )
+
+        ious = []
+        overlays = []
+        for orig, proj in zip(raw_masks, reproj_masks):
+            inter = (orig & proj).sum()
+            union = (orig | proj).sum()
+            ious.append(float(inter) / float(union) if union > 0 else 1.0)
+
+            H_m, W_m = orig.shape
+            rgb = np.zeros((H_m, W_m, 3), dtype=np.uint8)
+            both  = orig & proj
+            green = proj & ~orig          # hull only
+            blue  = orig & ~proj          # mask only
+            rgb[both,  :] = [255, 255, 255]
+            rgb[green, :] = [80,  220,  80]
+            rgb[blue,  :] = [80,  130, 255]
+            overlays.append(rgb)
+
+        mean_iou = float(np.mean(ious))
+        ri1, ri2, ri3 = st.columns(3)
+        ri1.metric("Mean IoU", f"{mean_iou:.3f}")
+        ri2.metric("Best view IoU",  f"{max(ious):.3f}")
+        ri3.metric("Worst view IoU", f"{min(ious):.3f}")
+
+        if mean_iou >= 0.80:
+            st.success("Good reprojection (IoU ≥ 0.80) — masks and camera model are consistent.")
+        elif mean_iou >= 0.55:
+            st.warning(
+                "Moderate reprojection (IoU 0.55–0.80). "
+                "Check camera distance, polar angle θ, and mask quality."
+            )
+        else:
+            st.error(
+                "Poor reprojection (IoU < 0.55). Likely causes: wrong camera distance or FOV, "
+                "incorrect θ, or masks contain large shadows/noise."
+            )
+
+        max_cols = 4
+        n_show   = min(len(overlays), 8)
+        for row_start in range(0, n_show, max_cols):
+            cols = st.columns(min(max_cols, n_show - row_start))
+            for col, idx in zip(cols, range(row_start, row_start + len(cols))):
+                col.image(
+                    overlays[idx],
+                    caption=f"View {idx+1}  IoU={ious[idx]:.2f}",
+                    use_container_width=True,
+                )
 
     st.markdown("---")
 
@@ -1128,9 +1460,66 @@ elif page == "📦 3D Object Scan":
 
     st.markdown("---")
 
+    # ── Antipodal Grasp Planning ──────────────────────────────────────
+    st.subheader("🤏 Antipodal Grasp Candidates")
+    gc1, gc2 = st.columns([2, 1])
+    max_jaw  = gc1.slider("Max jaw opening (mm)", 20, 120, 80, 5) / 1000.0
+    n_grasps = gc2.number_input("Top-K candidates", 1, 8, 3)
+
+    with st.spinner("Computing grasp candidates…"):
+        grasps = find_grasps(
+            voxels, diameter, grid_center,
+            max_jaw_width=max_jaw,
+            n_directions=512,
+            top_k=int(n_grasps),
+        )
+
+    if not grasps:
+        st.warning("No valid grasp found — try increasing max jaw opening or capturing more views.")
+    else:
+        grasp_colors = ["🟢", "🟡", "🟠", "🟣", "🔵"]
+        for rank, g in enumerate(grasps):
+            col_icon = grasp_colors[rank % len(grasp_colors)]
+            with st.expander(
+                f"{col_icon} Grasp #{rank+1}  —  score {g.score:.3f}  "
+                f"|  width {g.width*1000:.1f} mm",
+                expanded=(rank == 0),
+            ):
+                ga, gb, gc_ = st.columns(3)
+                ga.metric("Overall score",   f"{g.score:.3f}")
+                gb.metric("Normal (friction)",f"{g.normal_score:.3f}")
+                gc_.metric("Width score",     f"{g.width_score:.3f}")
+
+                gd, ge, gf = st.columns(3)
+                gd.metric("Jaw opening",  f"{g.width*1000:.1f} mm")
+                ge.metric("Center score", f"{g.center_score:.3f}")
+                gf.metric("Rank", f"#{rank+1} / {len(grasps)}")
+
+                c1c, c2c, appc = st.columns(3)
+                c1c.markdown(
+                    f"**Jaw A contact**  \n"
+                    f"X={g.contact_1[0]*100:.1f} cm  \n"
+                    f"Y={g.contact_1[1]*100:.1f} cm  \n"
+                    f"Z={g.contact_1[2]*100:.1f} cm"
+                )
+                c2c.markdown(
+                    f"**Jaw B contact**  \n"
+                    f"X={g.contact_2[0]*100:.1f} cm  \n"
+                    f"Y={g.contact_2[1]*100:.1f} cm  \n"
+                    f"Z={g.contact_2[2]*100:.1f} cm"
+                )
+                appc.markdown(
+                    f"**Approach dir**  \n"
+                    f"X={g.approach_dir[0]:.2f}  \n"
+                    f"Y={g.approach_dir[1]:.2f}  \n"
+                    f"Z={g.approach_dir[2]:.2f}"
+                )
+
+    st.markdown("---")
+
     # ── 3D interactive figure ─────────────────────────────────────────
     st.subheader("Interactive 3D View")
-    show_grasp = st.checkbox("Show gripper & grasp axes", value=True)
+    show_grasp = st.checkbox("Show grasp candidates", value=True)
 
     try:
         fig = _make_scan_figure(
@@ -1138,13 +1527,15 @@ elif page == "📦 3D Object Scan":
             visited_angles=angles,
             nbv_angles=nbv_suggestions if run_nbv else None,
             show_grasp=show_grasp,
+            grid_center=grid_center,
+            grasps=grasps if show_grasp else None,
         )
         st.plotly_chart(fig, use_container_width=True)
     except ImportError:
         st.warning("Install plotly: `pip install plotly`")
 
-    st.caption("🔴 Long · 🟢 Mid · 🔵 Grasp axis  ·  "
-               "🟡 Gripper jaws  ·  🟦 Captured views  ·  🟠 NBV")
+    st.caption("🟣 Point cloud  ·  🔴/🟢/🟡 Grasp candidates (line = jaw span, arrow = approach)  "
+               "·  🟦 Captured views  ·  🟠 NBV suggestions")
 
     # ── Cross-section slices ──────────────────────────────────────────
     with st.expander("Cross-section slices"):
@@ -1168,21 +1559,16 @@ elif page == "📦 3D Object Scan":
     # ── Download PLY ──────────────────────────────────────────────────
     st.download_button(
         "⬇️ Download point cloud (.ply)",
-        data=_ply_bytes(voxels, diameter),
+        data=_ply_bytes(voxels, diameter, grid_center),
         file_name="heapgrasp_reconstruction.ply",
         mime="application/octet-stream",
     )
 
-    # ── Grasp Plan ────────────────────────────────────────────────────
+    # ── Grasp Plan (text summary of best grasp) ───────────────────────
     st.markdown("---")
-    st.subheader("📋 Theoretical Grasp Plan — Ford Industrial Arm")
-    st.markdown(
-        "Based on the 3D reconstruction, here is how the arm should theoretically "
-        "move to grasp this object. The camera is assumed to be mounted at the "
-        "gripper tip, pointing toward the object."
-    )
-
-    plan_text = generate_grasp_plan(voxels, diameter, cam_dist, len(raw_masks))
+    st.subheader("📋 Grasp Execution Plan — Ford Industrial Arm")
+    plan_text = generate_grasp_plan(voxels, diameter, cam_dist, len(raw_masks),
+                                    grid_center=grid_center)
     st.markdown(f"<div class='grasp-plan'>{plan_text}</div>", unsafe_allow_html=True)
 
     copy_col, _ = st.columns([1, 3])

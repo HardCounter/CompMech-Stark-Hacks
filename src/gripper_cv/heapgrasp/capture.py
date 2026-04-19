@@ -81,17 +81,20 @@ def capture_multiview(
             key = cv2.waitKey(30) & 0xFF
 
             if key == ord(" "):
+                # Grab a frame that arrived *after* SPACE was pressed so we
+                # don't accidentally save a frame from before the user acted.
+                captured = cam.wait_for_fresh_frame()
                 if state == -1:
-                    session.background = frame_rgb.copy()
+                    session.background = captured
                     print("Background captured. Place object at 0° and press SPACE.")
                     state = 0
                 elif state < n_views:
                     angle = state * step
-                    session.frames.append(frame_rgb.copy())
+                    session.frames.append(captured)
                     session.angles_deg.append(angle)
                     print(f"  View {state+1}/{n_views} captured at {angle:.0f}°")
                     if output_dir:
-                        bgr = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+                        bgr = cv2.cvtColor(captured, cv2.COLOR_RGB2BGR)
                         cv2.imwrite(str(output_dir / f"view_{state:03d}.jpg"), bgr)
                     state += 1
                     if state < n_views:
