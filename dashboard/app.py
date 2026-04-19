@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from gripper_cv.hailo import is_hailo_available
 from gripper_cv.heapgrasp.capture import CaptureSession
-from gripper_cv.heapgrasp.grasp import GraspCandidate, find_grasps
+from gripper_cv.heapgrasp.grasp import GraspCandidate, find_grasps, format_grasp_plan
 from gripper_cv.heapgrasp.reconstruct import (
     default_camera_matrix,
     estimate_grid_center,
@@ -369,6 +369,15 @@ def _run_sfs(
                                    camera_distance=cam_dist, grid_center=center,
                                    thetas_rad=thetas)
     return voxels, center
+
+
+def generate_grasp_plan(
+    voxels: np.ndarray,
+    diameter: float,
+    cam_dist: float,
+    n_views: int,
+) -> str:
+    return format_grasp_plan(voxels, diameter, cam_dist, n_views)
 
 
 def _overlay_mask(img: np.ndarray, mask: np.ndarray,

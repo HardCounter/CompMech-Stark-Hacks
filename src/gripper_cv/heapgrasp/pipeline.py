@@ -9,7 +9,8 @@ from pathlib import Path
 
 from .calibrate import CalibrationResult, auto_calibrate, estimate_object_diameter
 from .capture import capture_multiview
-from .export import save_masks, save_ply, save_voxels_npy
+from .export import save_grasps_json, save_masks, save_ply, save_voxels_npy
+from .grasp import grasp_from_voxels, grasps_to_json
 from .reconstruct import default_camera_matrix, shape_from_silhouette, voxels_to_pointcloud
 from .segment import extract_silhouettes
 
@@ -35,6 +36,10 @@ def run_pipeline(
     seg_img_size: tuple = (512, 512),
     theta_deg: float = 90.0,
     thetas_deg: list | None = None,
+    plan_grasp: bool = True,
+    top_k_grasps: int = 5,
+    grasp_onnx_path: str | None = None,
+    grasp_hef_path: str | None = None,
 ) -> None:
     """
     Run the full HEAPGrasp pipeline.
@@ -62,6 +67,10 @@ def run_pipeline(
                           HEAPGrasp hand-eye uses ~36° (π/5 rad).
         thetas_deg:       per-view polar angles (degrees); overrides theta_deg if given.
                           Use this when the robot arm provides exact viewpoint poses.
+        plan_grasp:       if True, rank parallel-jaw grasps and save grasps.json
+        top_k_grasps:     number of grasps to export (ranked best-first)
+        grasp_onnx_path:  optional ONNX model for a learned grasp quality scorer
+        grasp_hef_path:   optional .hef for running the scorer on the Hailo-8L
     """
     out = Path(output_dir)
 
@@ -209,5 +218,46 @@ def run_pipeline(
     points = voxels_to_pointcloud(voxels, object_diameter)
     save_ply(points, out / "reconstruction.ply")
     save_voxels_npy(voxels, out / "voxels.npy")
+
+    # ── 5. Grasp planning ─────────────────────────────────────────────────
+    if plan_grasp:
+        print(f"\nRanking top-{top_k_grasps} parallel-jaw grasps…")
+        score_fn = None
+        scorer = None
+        if grasp_hef_path or grasp_onnx_path:
+            from .grasp_learned import LearnedGraspScorer
+            scorer = LearnedGraspScorer(
+                onnx_path=grasp_onnx_path, hef_path=grasp_hef_path,
+            )
+            score_fn = scorer.score_fn
+            print(f"  [grasp] learned scorer backend: {scorer.backend}")
+        try:
+            grasps = grasp_from_voxels(
+                voxels, object_diameter, top_k=top_k_grasps,
+            )
+        finally:
+            if scorer is not None:
+                scorer.close()
+
+        payload = grasps_to_json(
+            grasps,
+            extra={
+                "n_views": len(session.angles_deg),
+                "volume_size": volume_size,
+                "object_diameter_m": object_diameter,
+                "camera_distance_m": camera_distance,
+                "segmentation": effective_method,
+            },
+        )
+        save_grasps_json(payload, out / "grasps.json")
+        if grasps:
+            best = grasps[0]
+            print(
+                f"  Top grasp: score={best.score:.3f}  "
+                f"width={best.width*100:.1f} cm  "
+                f"center={tuple(round(c*100,1) for c in best.center)} cm"
+            )
+        else:
+            print("  [grasp] Visual hull too small for grasp planning.")
 
     print("\nDone! Open outputs/heapgrasp/reconstruction.ply in MeshLab or CloudCompare.")

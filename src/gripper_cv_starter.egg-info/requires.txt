@@ -2,6 +2,21 @@ numpy>=1.26
 Pillow>=10.0
 simplejpeg>=1.7
 
+[dashboard]
+streamlit>=1.35
+plotly>=5.20
+matplotlib>=3.8
+
+[dev]
+pytest>=8.0
+
+[hailo]
+hailort
+
 [ml]
+torch>=2.2
+torchvision>=0.17
+
+[training]
 torch>=2.2
 torchvision>=0.17

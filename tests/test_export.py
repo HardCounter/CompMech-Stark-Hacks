@@ -1,11 +1,18 @@
-"""Tests for PLY and numpy export."""
+"""Tests for PLY, numpy, and grasps.json export."""
+import json
 import tempfile
 from pathlib import Path
 
 import numpy as np
 import pytest
 
-from gripper_cv.heapgrasp.export import save_masks, save_ply, save_voxels_npy
+from gripper_cv.heapgrasp.export import (
+    save_grasps_json,
+    save_masks,
+    save_ply,
+    save_voxels_npy,
+)
+from gripper_cv.heapgrasp.grasp import GraspCandidate, grasps_to_json
 
 
 class TestSavePly:
@@ -88,3 +95,37 @@ class TestSaveMasks:
             names = {p.name for p in out.glob("*.png")}
         assert "mask_000.png" in names
         assert "mask_001.png" in names
+
+
+class TestSaveGraspsJson:
+    def _sample_payload(self) -> dict:
+        g = GraspCandidate(
+            position=(0.01, 0.02, 0.03),
+            approach=(0.0, 0.0, -1.0),
+            jaw_axis=(1.0, 0.0, 0.0),
+            width=0.05,
+            score=0.75,
+        )
+        return grasps_to_json([g], extra={"views": 8})
+
+    def test_creates_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "grasps.json"
+            save_grasps_json(self._sample_payload(), path)
+            assert path.exists()
+
+    def test_round_trip(self):
+        payload = self._sample_payload()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "grasps.json"
+            save_grasps_json(payload, path)
+            decoded = json.loads(path.read_text())
+        assert decoded["frame"] == "turntable_world"
+        assert decoded["grasps"][0]["score"] == pytest.approx(0.75)
+        assert decoded["meta"]["views"] == 8
+
+    def test_creates_parent_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "nested" / "deep" / "grasps.json"
+            save_grasps_json(self._sample_payload(), path)
+            assert path.exists()

@@ -22,17 +22,30 @@ Algorithm
      - width_score   : Gaussian preference for an "ideal" jaw opening
      - center_score  : midpoint close to the object centroid (stability)
 4. De-duplicate directions that are nearly parallel and return top-K.
+
+Utility exports
+---------------
+grasp_from_voxels  — convenience wrapper around find_grasps
+grasps_to_json     — package candidates as a JSON-ready dict
+format_grasp_plan  — human-readable arm movement plan (shared with dashboard)
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from .reconstruct import voxels_to_pointcloud
 
+Vec3 = Tuple[float, float, float]
+ScoreFn = Callable[["GraspCandidate", np.ndarray], float]
+
+
+# ---------------------------------------------------------------------------
+# Primary grasp data model
+# ---------------------------------------------------------------------------
 
 @dataclass
 class GraspCandidate:
@@ -48,6 +61,52 @@ class GraspCandidate:
     width_score: float = 0.0
     center_score: float = 0.0
 
+    def to_dict(self) -> dict:
+        return {
+            "center_m":      [float(v) for v in self.center],
+            "contact_1_m":   [float(v) for v in self.contact_1],
+            "contact_2_m":   [float(v) for v in self.contact_2],
+            "closing_dir":   [float(v) for v in self.closing_dir],
+            "approach_dir":  [float(v) for v in self.approach_dir],
+            "width_m":       float(self.width),
+            "score":         float(self.score),
+            "normal_score":  float(self.normal_score),
+            "width_score":   float(self.width_score),
+            "center_score":  float(self.center_score),
+        }
+
+
+# ---------------------------------------------------------------------------
+# PCA shape summary (used by format_grasp_plan)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ObjectShape:
+    """PCA-based shape summary of the point cloud (world frame)."""
+    centroid: Vec3
+    long_axis: Vec3
+    mid_axis: Vec3
+    short_axis: Vec3
+    extents_m: Tuple[float, float, float]
+
+    @classmethod
+    def from_points(cls, points: np.ndarray) -> "ObjectShape":
+        if len(points) < 4:
+            raise ValueError("Need at least 4 points to estimate shape.")
+        centroid, eigvals, eigvecs = _pca(points)
+        spans = tuple(float(2.0 * np.sqrt(max(ev, 0.0)) * 2.5) for ev in eigvals)
+        return cls(
+            centroid=_totuple(centroid),
+            long_axis=_totuple(eigvecs[:, 0]),
+            mid_axis=_totuple(eigvecs[:, 1]),
+            short_axis=_totuple(eigvecs[:, 2]),
+            extents_m=spans,  # type: ignore[arg-type]
+        )
+
+
+# ---------------------------------------------------------------------------
+# Antipodal planner internals
+# ---------------------------------------------------------------------------
 
 def _extract_surface(
     voxels: np.ndarray,
@@ -57,11 +116,6 @@ def _extract_surface(
 
     A surface voxel is occupied with at least one empty 6-connected neighbour.
     The outward normal is the normalised sum of directions toward empty neighbours.
-
-    Returns
-    -------
-    indices : (N, 3) int   — (i, j, k) grid indices of surface voxels
-    normals : (N, 3) float — unit outward normals
     """
     occ = voxels.astype(bool)
     is_surface = np.zeros(occ.shape, dtype=bool)
@@ -69,13 +123,12 @@ def _extract_surface(
 
     for ax in range(3):
         for sign in (1, -1):
-            # Roll neighbour into place; blank the wrapped edge.
             nbr = np.roll(occ, sign, axis=ax)
             edge = [slice(None)] * 3
             edge[ax] = 0 if sign > 0 else -1
             nbr[tuple(edge)] = False
 
-            cond = occ & ~nbr                    # occupied, empty neighbour
+            cond = occ & ~nbr
             is_surface |= cond
 
             direction = np.zeros(3, dtype=np.float32)
@@ -117,6 +170,10 @@ def _approach_for(closing_dir: np.ndarray) -> np.ndarray:
     return proj / np.linalg.norm(proj)
 
 
+# ---------------------------------------------------------------------------
+# Main planner
+# ---------------------------------------------------------------------------
+
 def find_grasps(
     voxels: np.ndarray,
     object_diameter: float,
@@ -147,7 +204,6 @@ def find_grasps(
     ctr = np.zeros(3) if grid_center is None else np.asarray(grid_center, dtype=float)
     half = object_diameter / 2.0
 
-    # Surface voxels → world positions and outward normals
     surf_idx, surf_normals = _extract_surface(voxels)
     if len(surf_idx) == 0:
         return []
@@ -159,14 +215,12 @@ def find_grasps(
         lin_x[surf_idx[:, 0]],
         lin_y[surf_idx[:, 1]],
         lin_z[surf_idx[:, 2]],
-    ], axis=1)                              # (N_surf, 3)
+    ], axis=1)
 
-    # Centroid from full point cloud
     centroid = pts_all.mean(0)
 
-    # Candidate closing directions: PCA axes + hemisphere sample
     cov = np.cov((pts_all - centroid).T)
-    _, eigvecs = np.linalg.eigh(cov)       # ascending eigenvalues
+    _, eigvecs = np.linalg.eigh(cov)
     pca_dirs = np.vstack([eigvecs.T, -eigvecs.T])
     hem_dirs = _sample_hemisphere(n_directions)
     all_dirs = np.vstack([pca_dirs, hem_dirs])
@@ -181,7 +235,6 @@ def find_grasps(
             continue
         d = d_raw / norm
 
-        # Extreme surface points along closing direction
         projs = surf_pts @ d
         i1, i2 = int(np.argmin(projs)), int(np.argmax(projs))
         width = float(projs[i2] - projs[i1])
@@ -189,7 +242,6 @@ def find_grasps(
         if width < 0.003 or width > max_jaw_width:
             continue
 
-        # De-duplicate: skip nearly-parallel directions
         if any(abs(float(np.dot(d, s))) > 0.95 for s in seen_dirs):
             continue
 
@@ -198,19 +250,14 @@ def find_grasps(
         n1 = surf_normals[i1]
         n2 = surf_normals[i2]
 
-        # Friction-cone proxy: normals should oppose the jaw direction
-        # n1 faces away from object at c1, should point in -d (toward jaw A)
-        # n2 faces away from object at c2, should point in +d (toward jaw B)
         f1 = float(np.dot(n1, -d))
         f2 = float(np.dot(n2,  d))
         normal_score = float(np.clip((f1 + f2) / 2.0, 0.0, 1.0))
 
-        # Width score: Gaussian around ideal opening
         width_score = float(
             np.exp(-((width - ideal_width) / (ideal_width * 0.5)) ** 2)
         )
 
-        # Center score: TCP close to object centroid
         center = (c1 + c2) / 2.0
         center_score = float(
             np.exp(-np.linalg.norm(center - centroid) / (object_diameter * 0.3))
@@ -234,3 +281,195 @@ def find_grasps(
 
     candidates.sort(key=lambda g: -g.score)
     return candidates[:top_k]
+
+
+# ---------------------------------------------------------------------------
+# Convenience wrappers
+# ---------------------------------------------------------------------------
+
+def grasp_from_voxels(
+    voxels: np.ndarray,
+    object_diameter: float,
+    top_k: int = 5,
+    n_candidates: int = 256,
+    score_fn: Optional[ScoreFn] = None,
+) -> List[GraspCandidate]:
+    """
+    Sample and rank grasps directly from an SfS occupancy grid.
+
+    ``score_fn`` is accepted for API compatibility with the learned scorer
+    (``LearnedGraspScorer.score_fn``) but is not used by the geometric planner;
+    pass it only when you have a trained ONNX/Hailo scorer available.
+    """
+    return find_grasps(voxels, object_diameter, n_directions=n_candidates, top_k=top_k)
+
+
+def grasps_to_json(
+    grasps: Sequence[GraspCandidate],
+    *,
+    frame: str = "turntable_world",
+    extra: Optional[dict] = None,
+) -> dict:
+    """Package a list of grasps as a JSON-ready dict for the robot controller."""
+    doc: dict = {
+        "frame": frame,
+        "convention": {
+            "x": "right", "y": "up", "z": "toward_camera_at_angle_0",
+        },
+        "grasps": [g.to_dict() for g in grasps],
+    }
+    if extra:
+        doc["meta"] = extra
+    return doc
+
+
+# ---------------------------------------------------------------------------
+# Natural-language plan (shared with dashboard)
+# ---------------------------------------------------------------------------
+
+def format_grasp_plan(
+    voxels: np.ndarray,
+    object_diameter: float,
+    camera_distance: float,
+    n_views: int,
+) -> str:
+    """Render a human-readable arm movement plan from the visual hull."""
+    points = voxels_to_pointcloud(voxels, object_diameter)
+    if len(points) < 8:
+        return (
+            "Insufficient point cloud data.\n"
+            "Capture more views for a reliable grasp plan."
+        )
+
+    shape = ObjectShape.from_points(points)
+    centroid = np.asarray(shape.centroid)
+    long_ax  = np.asarray(shape.long_axis)
+    short_ax = np.asarray(shape.short_axis)
+    spans_m  = sorted(shape.extents_m, reverse=True)
+
+    dim_str  = "  x  ".join(f"{d * 100:.1f} cm" for d in spans_m)
+    dx_cm    = float(centroid[0]) * 100.0
+    dy_cm    = float(centroid[1]) * 100.0
+
+    jaw_xy   = np.array([long_ax[0], long_ax[1]])
+    wrist_deg = (
+        float(np.degrees(np.arctan2(jaw_xy[1], jaw_xy[0])))
+        if np.linalg.norm(jaw_xy) > 0.1 else 0.0
+    )
+
+    jaw_span_cm = float(2.0 * np.sqrt(max((spans_m[0] / 5.0) ** 2, 0.0))) * 100.0
+    jaw_open_cm = jaw_span_cm + 1.5
+
+    _axis_desc = {0: "horizontal (left-right)", 1: "vertical (up-down)", 2: "axial (depth)"}
+    jaw_desc   = _axis_desc[int(np.argmax(np.abs(long_ax)))]
+    grasp_desc = _axis_desc[int(np.argmax(np.abs(short_ax)))]
+
+    if spans_m[0] > 0.10:
+        grip_type = "two-finger power grip (large object)"
+    elif spans_m[0] < 0.04:
+        grip_type = "precision pinch (small object)"
+    else:
+        grip_type = "standard parallel-jaw pinch"
+
+    fill_pct = 100.0 * int(voxels.sum()) / voxels.size
+    width    = 65
+    sep      = "=" * width
+    sub      = "-" * (width - 4)
+
+    lines: List[str] = [
+        sep,
+        "  THEORETICAL GRASP PLAN  -  HEAPGrasp",
+        f"  {n_views}-view reconstruction  |  camera distance {camera_distance * 100:.0f} cm",
+        sep, "",
+        "  OBJECT SUMMARY",
+        f"  {'Estimated dimensions':<28}{dim_str}",
+        f"  {'Jaw span axis':<28}{jaw_desc}",
+        f"  {'Approach axis':<28}{grasp_desc}",
+        f"  {'Recommended grip':<28}{grip_type}",
+        f"  {'Reconstruction fill':<28}{fill_pct:.0f} %  ({int(voxels.sum()):,} occupied voxels)",
+        "", f"  {sub}",
+        "  1. LATERAL ALIGNMENT", f"  {sub}",
+        "  Camera (mounted at gripper tip) sees the object at:",
+    ]
+
+    if abs(dx_cm) > 0.3:
+        dirn = "right" if dx_cm > 0 else "left"
+        axis = "right (+X)" if dx_cm > 0 else "left (-X)"
+        lines += [f"    - {abs(dx_cm):.1f} cm to the {dirn} of optical centre",
+                  f"      -> Translate TCP {abs(dx_cm):.1f} cm {axis}"]
+    else:
+        lines.append("    - Centred horizontally  (no X correction needed)")
+
+    if abs(dy_cm) > 0.3:
+        dirn = "above" if dy_cm > 0 else "below"
+        axis = "up (+Y)" if dy_cm > 0 else "down (-Y)"
+        lines += [f"    - {abs(dy_cm):.1f} cm {dirn} optical centre",
+                  f"      -> Translate TCP {abs(dy_cm):.1f} cm {axis}"]
+    else:
+        lines.append("    - Centred vertically    (no Y correction needed)")
+
+    lines += [
+        "", f"  {sub}", "  2. WRIST ROTATION", f"  {sub}",
+    ]
+    if abs(wrist_deg) > 5.0:
+        dirn = "counter-clockwise" if wrist_deg > 0 else "clockwise"
+        lines += [
+            f"  Jaw axis is {abs(wrist_deg):.0f} deg from horizontal in the image plane.",
+            f"    -> Rotate wrist {abs(wrist_deg):.0f} deg  {dirn}",
+        ]
+    else:
+        lines.append("  Jaw axis is approximately horizontal — no wrist rotation needed.")
+
+    lines += [
+        "", f"  {sub}", "  3. OPEN JAWS", f"  {sub}",
+        f"  Object span along jaw axis:  {jaw_span_cm:.1f} cm",
+        f"    -> Set jaw opening to  {jaw_open_cm:.1f} cm",
+        f"       ({jaw_span_cm:.1f} cm object  +  1.5 cm clearance)",
+        "", f"  {sub}", "  4. APPROACH", f"  {sub}",
+        f"  Object is {camera_distance * 100:.0f} cm from the gripper tip.",
+        f"    -> Advance {camera_distance * 100:.0f} cm along gripper Z-axis.",
+        "    -> Speed: SLOW — transparent/specular surface, uncertain contact.",
+        "", f"  {sub}", "  5. GRASP", f"  {sub}",
+        "    -> Close jaws to contact resistance.",
+        "    -> Monitor SlipDetectorCNN: stable → continue  |  slipping → re-seat.",
+        "", f"  {sub}", "  6. RETRIEVE", f"  {sub}",
+        "    -> Raise TCP 5 cm vertically to clear the surface.",
+        "    -> Translate to deposit location at REDUCED speed.",
+        "", sep, "  SAFETY NOTES",
+        "  This plan is THEORETICAL — generated from camera data only.",
+        "  A human operator must verify all clearances before executing.",
+        f"  Reconstruction quality: {fill_pct:.0f}% voxel fill from {n_views} views.",
+        sep,
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _pca(points: np.ndarray):
+    centroid = points.mean(0)
+    cov = np.cov((points - centroid).T)
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    order = np.argsort(eigvals)[::-1]
+    return centroid, eigvals[order], eigvecs[:, order]
+
+
+def _unit(v: np.ndarray) -> np.ndarray:
+    n = float(np.linalg.norm(v))
+    return v if n < 1e-9 else v / n
+
+
+def _totuple(v: np.ndarray) -> Vec3:
+    return (float(v[0]), float(v[1]), float(v[2]))
+
+
+__all__ = [
+    "GraspCandidate",
+    "ObjectShape",
+    "find_grasps",
+    "grasp_from_voxels",
+    "grasps_to_json",
+    "format_grasp_plan",
+]
