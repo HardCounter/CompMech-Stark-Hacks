@@ -44,7 +44,7 @@
 
 **Audio Script:**
 > **Impact (15%):** We drastically cut sensing complexity for real industry use-cases. 
-> **Innovation (30%):** We push boundaries using a March 2026 multi-view architecture. 
+> **Innovation (30%):** We push boundaries using a January 2026 multi-view architecture. 
 > **Performance (20%):** Our pipeline executes at ultra-low latency, ensuring high first-pick success. 
 > **Technical Execution (20%):** Perception and robot control run in a deterministic, collision-free loop. 
 > **Feasibility (15%):** Utilizing commodity cameras and our software stack makes this highly viable for immediate, cost-effective factory deployment.
