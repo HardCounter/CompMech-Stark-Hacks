@@ -40,6 +40,7 @@ def remove_shadows(
     background_rgb: np.ndarray,
     darkness: float = 0.20,
     chroma_tol: float = 14.0,
+    min_object_l: float = 30.0,
 ) -> np.ndarray:
     """
     Remove shadow pixels from a background-subtraction mask.
@@ -49,20 +50,23 @@ def remove_shadows(
     operates in CIE Lab space where lightness (L) and chrominance (a*, b*)
     are independent:
 
-      shadow  → L drops significantly, |Δa*| and |Δb*| stay small
-      object  → L may drop or rise, but a*/b* differ OR L drop is minimal
+      shadow      → L drops significantly, |Δa*| and |Δb*| stay small,
+                    BUT the frame pixel is still relatively bright
+                    (shadows retain ambient light, L* ≳ 30–40)
+      dark object → L* in the frame is absolutely low (L* < min_object_l)
+                    regardless of chrominance — not a shadow
 
     Parameters
     ----------
-    mask            : (H, W) bool foreground mask from absdiff
-    frame_rgb       : (H, W, 3) uint8 RGB current frame
-    background_rgb  : (H, W, 3) uint8 RGB background frame
-    darkness        : fraction of L* range [0,100] that must drop to
-                      qualify as a shadow. 0.20 = at least 20 L* units
-                      darker.  Raise for stricter (only deep shadows);
-                      lower for aggressive removal.
-    chroma_tol      : max |Δa*| and |Δb*| allowed for a shadow pixel.
-                      Smaller = stricter (fewer pixels removed).
+    mask           : (H, W) bool foreground mask from absdiff
+    frame_rgb      : (H, W, 3) uint8 RGB current frame
+    background_rgb : (H, W, 3) uint8 RGB background frame
+    darkness       : min L* drop (fraction of 100) to qualify as a shadow.
+    chroma_tol     : max |Δa*| and |Δb*| allowed for a shadow pixel.
+    min_object_l   : pixels whose frame L* is below this are treated as dark
+                     objects, not shadows, and are never removed.
+                     Shadows always retain some ambient light (L* ≳ 30–40);
+                     dark objects can reach L* = 5–20.
 
     Returns
     -------
@@ -81,9 +85,11 @@ def remove_shadows(
     db     = np.abs(frame_lab[..., 2] - bg_lab[..., 2])
 
     shadow = (
-        (L_drop > darkness * 100.0) &   # significantly darker
-        (da < chroma_tol) &              # same hue
-        (db < chroma_tol)
+        (L_drop > darkness * 100.0) &          # significantly darker
+        (da < chroma_tol) &                    # same hue
+        (db < chroma_tol) &
+        (frame_lab[..., 0] >= min_object_l)    # frame pixel is not too dark
+                                               # (dark objects have low L*, shadows don't)
     )
 
     cleaned = (mask & ~shadow).astype(np.uint8) * 255
@@ -122,6 +128,7 @@ def _bg_subtract(
     shadow_removal: bool = True,
     shadow_darkness: float = 0.20,
     shadow_chroma_tol: float = 14.0,
+    shadow_min_object_l: float = 30.0,
     contrast_enhance: bool = False,
     clahe_clip: float = 2.0,
 ) -> np.ndarray:
@@ -140,6 +147,7 @@ def _bg_subtract(
             mask, frame_rgb, background_rgb,
             darkness=shadow_darkness,
             chroma_tol=shadow_chroma_tol,
+            min_object_l=shadow_min_object_l,
         )
     return mask
 
@@ -273,6 +281,7 @@ def extract_silhouettes(
     shadow_removal: bool = True,
     shadow_darkness: float = 0.20,
     shadow_chroma_tol: float = 14.0,
+    shadow_min_object_l: float = 30.0,
     contrast_enhance: bool = False,
     clahe_clip: float = 2.0,
 ) -> List[np.ndarray]:
@@ -280,18 +289,20 @@ def extract_silhouettes(
     Return a list of binary silhouette masks (H, W) bool, one per view.
 
     Args:
-        session:            CaptureSession from capture_multiview()
-        method:             "background", "deeplab", "finetuned", or "hailo"
-        device:             torch device string (for deeplab / finetuned)
-        bg_threshold:       pixel difference threshold (for background method)
-        checkpoint:         path to .pt checkpoint (required for method="finetuned")
-        hef_path:           path to compiled .hef model (required for method="hailo")
-        img_size:           (H, W) the model was compiled for (hailo only)
-        shadow_removal:     if True, remove shadow pixels from background-subtraction masks
-        shadow_darkness:    min L* drop (fraction of 100) to classify a pixel as shadow
-        shadow_chroma_tol:  max |Δa*| / |Δb*| to classify a pixel as shadow
-        contrast_enhance:   if True, apply CLAHE to frames before diffing
-        clahe_clip:         CLAHE clip limit (higher = stronger contrast boost)
+        session:              CaptureSession from capture_multiview()
+        method:               "background", "deeplab", "finetuned", or "hailo"
+        device:               torch device string (for deeplab / finetuned)
+        bg_threshold:         pixel difference threshold (for background method)
+        checkpoint:           path to .pt checkpoint (required for method="finetuned")
+        hef_path:             path to compiled .hef model (required for method="hailo")
+        img_size:             (H, W) the model was compiled for (hailo only)
+        shadow_removal:       if True, remove shadow pixels from background-subtraction masks
+        shadow_darkness:      min L* drop (fraction of 100) to classify a pixel as shadow
+        shadow_chroma_tol:    max |Δa*| / |Δb*| to classify a pixel as shadow
+        shadow_min_object_l:  pixels with frame L* below this are never removed as shadows
+                              (protects dark objects from being erased)
+        contrast_enhance:     if True, apply CLAHE to frames before diffing
+        clahe_clip:           CLAHE clip limit (higher = stronger contrast boost)
     """
     masks: List[np.ndarray] = []
 
@@ -304,6 +315,7 @@ def extract_silhouettes(
                 shadow_removal=shadow_removal,
                 shadow_darkness=shadow_darkness,
                 shadow_chroma_tol=shadow_chroma_tol,
+                shadow_min_object_l=shadow_min_object_l,
                 contrast_enhance=contrast_enhance,
                 clahe_clip=clahe_clip,
             ))

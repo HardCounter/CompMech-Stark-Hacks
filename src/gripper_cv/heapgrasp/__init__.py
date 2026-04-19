@@ -13,11 +13,10 @@ from typing import Any
 from .grasp import (
     GraspCandidate,
     ObjectShape,
+    find_grasps,
     format_grasp_plan,
     grasp_from_voxels,
     grasps_to_json,
-    pca_grasp,
-    sample_grasps,
 )
 from .grasp_learned import LearnedGraspScorer, PatchRender, render_grasp_patch
 
@@ -25,8 +24,7 @@ __all__ = [
     "run_pipeline",
     "GraspCandidate",
     "ObjectShape",
-    "pca_grasp",
-    "sample_grasps",
+    "find_grasps",
     "grasp_from_voxels",
     "grasps_to_json",
     "format_grasp_plan",

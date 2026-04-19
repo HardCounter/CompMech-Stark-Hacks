@@ -445,6 +445,113 @@ def format_grasp_plan(
 
 
 # ---------------------------------------------------------------------------
+# Natural-language execution instructions for a single grasp
+# ---------------------------------------------------------------------------
+
+def format_grasp_instructions(grasp: "GraspCandidate", rank: int = 1) -> str:
+    """
+    Render step-by-step arm movement instructions for executing one grasp.
+
+    All positions are in the world frame with the object centre at the origin.
+    """
+    d  = np.asarray(grasp.closing_dir,  dtype=float)
+    a  = np.asarray(grasp.approach_dir, dtype=float)
+    c  = np.asarray(grasp.center,       dtype=float)
+    c1 = np.asarray(grasp.contact_1,    dtype=float)
+    c2 = np.asarray(grasp.contact_2,    dtype=float)
+    w  = grasp.width
+
+    # ── Closing-direction description ─────────────────────────────────────
+    dom_ax   = int(np.argmax(np.abs(d)))
+    ax_label = ["X (left-right)", "Y (up-down)", "Z (front-back)"][dom_ax]
+    vert_tilt_deg  = float(np.degrees(np.arcsin(np.clip(abs(d[1]), 0.0, 1.0))))
+    horiz_angle_deg = float(np.degrees(np.arctan2(d[0], d[2])))
+
+    # ── Approach-direction description ────────────────────────────────────
+    dom_ap   = int(np.argmax(np.abs(a)))
+    ap_sign  = int(np.sign(a[dom_ap]))
+    _ap_desc = {
+        (0,  1): "from the right  (+X)",
+        (0, -1): "from the left   (−X)",
+        (1,  1): "from above      (−Y, downward)",
+        (1, -1): "from below      (+Y, upward)",
+        (2,  1): "from the front  (+Z)",
+        (2, -1): "from behind     (−Z)",
+    }
+    ap_desc = _ap_desc.get((dom_ap, ap_sign),
+                           f"({a[0]:+.2f}, {a[1]:+.2f}, {a[2]:+.2f})")
+
+    def _p(v: np.ndarray) -> str:
+        return (f"X={v[0]*100:+.1f} cm, "
+                f"Y={v[1]*100:+.1f} cm, "
+                f"Z={v[2]*100:+.1f} cm")
+
+    width_mm  = w * 1000.0
+    open_mm   = width_mm + 15.0      # 15 mm safety clearance each side
+
+    sep = "─" * 58
+    lines = [
+        sep,
+        f"  GRASP #{rank} EXECUTION PLAN  "
+        f"(score {grasp.score:.3f} | width {width_mm:.0f} mm)",
+        sep, "",
+        "  1. OPEN JAWS",
+        f"     → Open to {open_mm:.0f} mm",
+        f"       ({width_mm:.0f} mm object span + 15 mm clearance)",
+        "",
+        "  2. APPROACH",
+        f"     → Move arm {ap_desc}",
+        f"       Approach vector (world): "
+        f"({a[0]:+.2f}, {a[1]:+.2f}, {a[2]:+.2f})",
+        "",
+        "  3. ALIGN TCP",
+        f"     → TCP target from object centre:",
+        f"       {_p(c)}",
+        "",
+        "  4. ORIENT WRIST  (align jaw axis)",
+        f"     → Jaws close along dominant axis: {ax_label}",
+        f"     → Closing vector (world): ({d[0]:+.2f}, {d[1]:+.2f}, {d[2]:+.2f})",
+        f"     → Tilt from horizontal: {vert_tilt_deg:.0f}°",
+        f"     → Horizontal rotation from front (Z): {horiz_angle_deg:.0f}°",
+        "",
+        "  5. CONTACT POINTS  (verify clearance)",
+        f"     → Jaw A: {_p(c1)}",
+        f"     → Jaw B: {_p(c2)}",
+        "",
+        "  6. CLOSE JAWS",
+        "     → Close until contact resistance",
+        f"     → Friction score: {grasp.normal_score:.2f}  "
+        f"| Width score: {grasp.width_score:.2f}  "
+        f"| Stability: {grasp.center_score:.2f}",
+        "     → Monitor slip detector: stable → continue  |  slipping → re-seat",
+        "",
+        "  7. RETRIEVE",
+        "     → Lift 5 cm vertically to clear object surface",
+        "     → Translate to deposit location at reduced speed",
+        "",
+        sep,
+    ]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Default geometric scorer (fallback for LearnedGraspScorer)
+# ---------------------------------------------------------------------------
+
+def default_score(cand: GraspCandidate, points: np.ndarray) -> float:
+    """
+    Heuristic quality score in [0, 1] used as a fallback when no learned
+    model is available. Rewards grasps close to the centroid with a
+    comfortable width.
+    """
+    centroid = points.mean(0)
+    dist = float(np.linalg.norm(cand.center - centroid))
+    extent = float(np.linalg.norm(points.max(0) - points.min(0)))
+    proximity = max(0.0, 1.0 - dist / (0.5 * extent + 1e-6))
+    return float(0.65 * proximity + 0.35 * cand.score)
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
@@ -472,4 +579,6 @@ __all__ = [
     "grasp_from_voxels",
     "grasps_to_json",
     "format_grasp_plan",
+    "default_score",
+    "ScoreFn",
 ]

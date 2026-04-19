@@ -33,10 +33,12 @@ except (ImportError, RuntimeError, Exception):
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+from gripper_cv.gripper.arduino import GripperController, GripperError
 from gripper_cv.hailo import is_hailo_available
 from gripper_cv.heapgrasp.capture import CaptureSession
-from gripper_cv.heapgrasp.grasp import GraspCandidate, find_grasps, format_grasp_plan
+from gripper_cv.heapgrasp.grasp import GraspCandidate, find_grasps, format_grasp_instructions, format_grasp_plan
 from gripper_cv.heapgrasp.reconstruct import (
+    _view_transform,
     default_camera_matrix,
     estimate_grid_center,
     reproject_hull,
@@ -99,6 +101,33 @@ if _HAILO_OK:
         pass
 
 # ---------------------------------------------------------------------------
+# Arduino gripper resource (opened once, kept alive across reruns)
+# ---------------------------------------------------------------------------
+
+_GRIPPER_PORT = "/dev/ttyUSB0"
+
+@st.cache_resource
+def _open_gripper(_attempt: int = 0) -> "GripperController | None":
+    """
+    Open the Arduino gripper serial connection and cache it.
+    _attempt is a dummy parameter — increment it via session_state to bust
+    the cache and force a reconnect (e.g. after plugging in the USB cable).
+    """
+    try:
+        g = GripperController(_GRIPPER_PORT)
+        g.connect()
+        return g
+    except Exception:
+        return None
+
+
+def _gripper_connected() -> bool:
+    attempt = st.session_state.get("gripper_attempt", 0)
+    g = _open_gripper(attempt)
+    return g is not None and g.is_connected
+
+
+# ---------------------------------------------------------------------------
 # Persistent capture session state
 # ---------------------------------------------------------------------------
 
@@ -110,6 +139,7 @@ if "cap_bg" not in st.session_state:
     # Polar angle θ from zenith at which all views were captured.
     # 90° = horizontal side view (turntable), 36° ≈ π/5 = HEAPGrasp hand-eye.
     st.session_state.cap_theta_deg: float = 90.0
+    st.session_state.cap_camera_dist: float = 0.40
 
 # ---------------------------------------------------------------------------
 # Sidebar
@@ -125,6 +155,19 @@ with st.sidebar:
                   else "⚠️ Hailo: not detected")
     st.markdown(f"<span class='hailo-pill {_pill_cls}'>{_pill_text}</span>",
                 unsafe_allow_html=True)
+
+    _grip_ok  = _gripper_connected()
+    _grip_cls = "hailo-ok" if _grip_ok else "hailo-off"
+    _grip_txt = "✅ Gripper: connected" if _grip_ok else "⚠️ Gripper: not found"
+    st.markdown(f"<span class='hailo-pill {_grip_cls}'>{_grip_txt}</span>",
+                unsafe_allow_html=True)
+    if not _grip_ok:
+        if st.button("🔄 Reconnect gripper", use_container_width=True):
+            st.session_state["gripper_attempt"] = (
+                st.session_state.get("gripper_attempt", 0) + 1
+            )
+            _open_gripper.clear()
+            st.rerun()
 
     st.markdown("---")
 
@@ -183,6 +226,7 @@ def _pi_capture_ui(
     shadow_removal: bool = True,
     shadow_darkness: float = 0.20,
     shadow_chroma_tol: float = 14.0,
+    shadow_min_object_l: float = 30.0,
     bg_threshold: int = 30,
 ) -> Optional[np.ndarray]:
     """
@@ -207,6 +251,7 @@ def _pi_capture_ui(
             shad = remove_shadows(
                 diff > bg_threshold, frm, bg,
                 darkness=shadow_darkness, chroma_tol=shadow_chroma_tol,
+                min_object_l=shadow_min_object_l,
             )
             diff = (diff * shad.astype(np.uint8))
         return diff
@@ -369,6 +414,33 @@ def _run_sfs(
                                    camera_distance=cam_dist, grid_center=center,
                                    thetas_rad=thetas)
     return voxels, center
+
+
+def compute_move_instructions(
+    from_angle_deg: float,
+    to_angle_deg: float,
+    theta_deg: float,
+    camera_distance: float,
+) -> dict:
+    """
+    Compute camera movement from one hemisphere position to the next.
+
+    Returns arc_deg (azimuthal rotation around object, + = CCW from above),
+    right_cm / up_cm / forward_cm (camera-frame translation), total_cm.
+    """
+    theta = np.radians(theta_deg)
+    R_from, C_from = _view_transform(from_angle_deg, theta, camera_distance)
+    _,      C_to   = _view_transform(to_angle_deg,   theta, camera_distance)
+    delta_world = C_to - C_from
+    delta_cam   = R_from @ delta_world
+    arc = (to_angle_deg - from_angle_deg + 180) % 360 - 180
+    return {
+        "arc_deg":    arc,
+        "right_cm":   float(delta_cam[0]) * 100.0,
+        "up_cm":      float(delta_cam[1]) * 100.0,
+        "forward_cm": float(delta_cam[2]) * 100.0,
+        "total_cm":   float(np.linalg.norm(delta_world)) * 100.0,
+    }
 
 
 def generate_grasp_plan(
@@ -819,6 +891,13 @@ elif page == "🎬 Live Capture":
         n_views = st.number_input("Views", min_value=4, max_value=24,
                                   value=st.session_state.cap_n_views, step=1)
         st.session_state.cap_n_views = int(n_views)
+        cap_dist = st.number_input(
+            "Camera distance (m)", min_value=0.10, max_value=2.00,
+            value=st.session_state.cap_camera_dist, step=0.05,
+            help="Approximate distance from camera to object centre. "
+                 "Used to compute movement instructions between views.",
+        )
+        st.session_state.cap_camera_dist = float(cap_dist)
     with cfg_col2:
         step_deg = 360.0 / n_views
         st.metric("Step per rotation", f"{step_deg:.1f}°")
@@ -843,10 +922,11 @@ elif page == "🎬 Live Capture":
             for k in list(st.session_state.keys()):
                 if k.startswith("_prev_"):
                     del st.session_state[k]
-            st.session_state.cap_bg       = None
-            st.session_state.cap_frames   = []
-            st.session_state.cap_angles   = []
-            st.session_state.cap_theta_deg = 90.0
+            st.session_state.cap_bg          = None
+            st.session_state.cap_frames      = []
+            st.session_state.cap_angles      = []
+            st.session_state.cap_theta_deg   = 90.0
+            st.session_state.cap_camera_dist = 0.40
             st.rerun()
 
     n_done = len(st.session_state.cap_frames)
@@ -875,6 +955,9 @@ elif page == "🎬 Live Capture":
             cap_sh_chroma    = cs3.slider("Chroma tol.", 2.0, 30.0, 14.0, 1.0,
                                           key="cap_sh_chroma",
                                           help="Max |Δa*|/|Δb*| for a shadow pixel.")
+            cap_sh_min_l     = st.slider("Dark object floor (L*)", 0.0, 60.0, 30.0, 5.0,
+                                         key="cap_sh_min_l",
+                                         help="Raise if a dark object vanishes from the preview mask.")
 
     _cap_kwargs = dict(
         contrast_enhance=cap_contrast_on,
@@ -882,6 +965,7 @@ elif page == "🎬 Live Capture":
         shadow_removal=cap_shadow_on,
         shadow_darkness=cap_sh_dark,
         shadow_chroma_tol=cap_sh_chroma,
+        shadow_min_object_l=cap_sh_min_l,
         bg_threshold=cap_bg_thresh,
     )
 
@@ -921,10 +1005,45 @@ elif page == "🎬 Live Capture":
                              caption=f"Captured at {angle:.0f}°",
                              use_container_width=True)
                 elif view_i == n_done:
-                    st.markdown(
-                        f"Rotate the object to **{angle:.0f}°** "
-                        f"({step_deg:.0f}° from the previous position)."
-                    )
+                    if view_i == 0:
+                        st.info(
+                            f"**Starting position** — position the camera anywhere on the "
+                            f"hemisphere at ~{cap_dist*100:.0f} cm from the object, "
+                            f"{90 - theta_input}° above horizontal (θ = {theta_input}°). "
+                            f"All subsequent instructions will be relative to this first position."
+                        )
+                    else:
+                        prev_angle = (view_i - 1) * step_deg
+                        mv = compute_move_instructions(
+                            prev_angle, angle, theta_input, cap_dist
+                        )
+                        arc_dir = "counter-clockwise" if mv["arc_deg"] > 0 else "clockwise"
+                        r_dir   = "right"   if mv["right_cm"]   >= 0 else "left"
+                        f_dir   = "forward" if mv["forward_cm"] >= 0 else "backward"
+                        u_dir   = "up"      if mv["up_cm"]      >= 0 else "down"
+
+                        st.markdown("**📍 Move camera to next position:**")
+                        mc1, mc2, mc3 = st.columns(3)
+                        mc1.metric(
+                            "↻ Rotate around object",
+                            f"{abs(mv['arc_deg']):.0f}°  {arc_dir}",
+                        )
+                        mc2.metric(
+                            f"↔ Slide {r_dir}",
+                            f"{abs(mv['right_cm']):.1f} cm",
+                        )
+                        mc3.metric(
+                            f"↕ Move {f_dir}",
+                            f"{abs(mv['forward_cm']):.1f} cm",
+                        )
+                        if abs(mv["up_cm"]) > 0.5:
+                            st.caption(f"Also move {abs(mv['up_cm']):.1f} cm {u_dir} to maintain height.")
+                        st.caption(
+                            f"Straight-line distance to new position: {mv['total_cm']:.1f} cm  |  "
+                            f"Keep {cap_dist*100:.0f} cm from object  |  "
+                            f"Point camera at object centre."
+                        )
+
                     frame = _pi_capture_ui(
                         f"View {view_i + 1} at {angle:.0f}°",
                         f"view_{view_i}",
@@ -1106,6 +1225,11 @@ elif page == "✂️ Segmentation":
                 sh_chroma  = sh2.slider("Chroma tol.", 2.0, 30.0, 14.0, 1.0,
                                         key="seg_sh_chroma",
                                         help="Max |Δa*|/|Δb*| for a shadow pixel.")
+                sh_min_l   = st.slider("Dark object floor (L*)", 0.0, 60.0, 30.0, 5.0,
+                                       key="seg_sh_min_l",
+                                       help="Pixels with frame L* below this are never "
+                                            "removed as shadows — protects dark objects. "
+                                            "Raise if a dark object is disappearing from the mask.")
 
         def _show_seg(bg, obj):
             if bg.shape != obj.shape:
@@ -1116,7 +1240,7 @@ elif page == "✂️ Segmentation":
             mask = extract_silhouettes(
                 sess, method="background", bg_threshold=threshold,
                 shadow_removal=shadow_on, shadow_darkness=sh_dark,
-                shadow_chroma_tol=sh_chroma,
+                shadow_chroma_tol=sh_chroma, shadow_min_object_l=sh_min_l,
                 contrast_enhance=contrast_on, clahe_clip=clahe_clip_v,
             )[0]
             c1, c2, c3, c4 = st.columns(4)
@@ -1251,6 +1375,9 @@ elif page == "📦 3D Object Scan":
                 live_sh_chroma     = ls3.slider("Chroma tol.", 2.0, 30.0, 14.0, 1.0,
                                                 key="live_sh_chroma",
                                                 help="Max |Δa*|/|Δb*| for a shadow pixel.")
+                live_sh_min_l      = st.slider("Dark object floor (L*)", 0.0, 60.0, 30.0, 5.0,
+                                               key="live_sh_min_l",
+                                               help="Raise if a dark object vanishes from the mask.")
 
         raw_masks, angles = [], []
         for frame, ang in zip(st.session_state.cap_frames, st.session_state.cap_angles):
@@ -1264,6 +1391,7 @@ elif page == "📦 3D Object Scan":
                 shadow_removal=live_shadow_on,
                 shadow_darkness=live_sh_dark,
                 shadow_chroma_tol=live_sh_chroma,
+                shadow_min_object_l=live_sh_min_l,
                 contrast_enhance=live_contrast_on,
                 clahe_clip=live_clahe_clip,
             )[0]
@@ -1523,6 +1651,130 @@ elif page == "📦 3D Object Scan":
                     f"Y={g.approach_dir[1]:.2f}  \n"
                     f"Z={g.approach_dir[2]:.2f}"
                 )
+
+                with st.expander("📋 Execution Instructions", expanded=(rank == 0)):
+                    st.code(format_grasp_instructions(g, rank + 1), language=None)
+
+                # ── Gripper execution ─────────────────────────────────────
+                with st.expander("🦾 Execute on Gripper", expanded=(rank == 0)):
+                    _grip = _open_gripper(st.session_state.get("gripper_attempt", 0))
+                    if _grip is None or not _grip.is_connected:
+                        st.warning(
+                            f"Arduino gripper not connected on `{_GRIPPER_PORT}`.  "
+                            "Check the USB cable and ensure the sketch is uploaded."
+                        )
+                    else:
+                        width_mm = g.width * 1000.0
+
+                        st.info(
+                            f"**Planned jaw opening:** {width_mm:.1f} mm\n\n"
+                            "Follow the Execution Instructions above to position "
+                            "the arm at the grasp centre, then use the buttons below."
+                        )
+
+                        # Servo calibration sliders (shared across all grasps)
+                        cal_col1, cal_col2, cal_col3 = st.columns(3)
+                        open_ang = cal_col1.slider(
+                            "Open angle (°)", 0, 180,
+                            st.session_state.get("grip_open_angle", 30),
+                            key=f"open_ang_{rank}",
+                        )
+                        close_ang = cal_col2.slider(
+                            "Close angle (°)", 0, 180,
+                            st.session_state.get("grip_close_angle", 150),
+                            key=f"close_ang_{rank}",
+                        )
+                        max_jaw = cal_col3.number_input(
+                            "Max jaw (mm)",
+                            min_value=5.0, max_value=200.0,
+                            value=st.session_state.get("grip_max_jaw", 80.0),
+                            step=5.0, key=f"max_jaw_{rank}",
+                        )
+                        st.session_state["grip_open_angle"]  = open_ang
+                        st.session_state["grip_close_angle"] = close_ang
+                        st.session_state["grip_max_jaw"]     = max_jaw
+                        _grip.open_angle  = open_ang
+                        _grip.close_angle = close_ang
+                        _grip.max_jaw_mm  = max_jaw
+
+                        # Compute target angle for this grasp
+                        ratio = max(0.0, min(1.0, width_mm / max_jaw))
+                        target_ang = int(open_ang + (close_ang - open_ang) * (1.0 - ratio))
+                        st.caption(f"Target angle for {width_mm:.0f} mm opening: **{target_ang}°**")
+
+                        btn_open, btn_grip, btn_stop = st.columns(3)
+
+                        if btn_open.button("⬆ Open jaws",
+                                           key=f"open_{rank}",
+                                           use_container_width=True):
+                            try:
+                                _grip.open_jaws()
+                                st.success(f"Jaws opened ({open_ang}°).")
+                            except GripperError as e:
+                                st.error(str(e))
+
+                        if btn_grip.button(
+                            f"✊ Grip  ({width_mm:.0f} mm → {target_ang}°)",
+                            key=f"grip_{rank}",
+                            type="primary",
+                            use_container_width=True,
+                        ):
+                            try:
+                                _grip.grip(width_mm)
+                                st.success(f"Gripping at {width_mm:.1f} mm → {target_ang}°.")
+                            except GripperError as e:
+                                st.error(str(e))
+
+                        if btn_stop.button("⏹ Detach",
+                                           key=f"stop_{rank}",
+                                           use_container_width=True):
+                            try:
+                                _grip.stop()
+                                st.warning("Servo detached.")
+                            except GripperError as e:
+                                st.error(str(e))
+
+                        with st.expander("Manual angle control"):
+                            manual_ang = st.slider(
+                                "Angle (°)", 0, 180, target_ang, 1,
+                                key=f"manual_ang_{rank}",
+                            )
+                            if st.button("Move to angle", key=f"manual_btn_{rank}"):
+                                try:
+                                    _grip.set_angle(manual_ang)
+                                    st.success(f"Moved to {manual_ang}°.")
+                                except GripperError as e:
+                                    st.error(str(e))
+
+                        with st.expander("🔌 Serial diagnostic"):
+                            st.caption(
+                                "Sends STATUS and shows the raw Arduino reply. "
+                                "If nothing appears, the sketch is not uploaded "
+                                "or the baud rate is wrong."
+                            )
+                            if st.button("Send STATUS", key=f"diag_status_{rank}"):
+                                try:
+                                    raw = _grip._send("STATUS")
+                                    st.success(f"Reply: `{raw}`")
+                                except GripperError as e:
+                                    st.error(str(e))
+                            if st.button("Listen for raw output (3 s)",
+                                         key=f"diag_raw_{rank}"):
+                                try:
+                                    # Send a newline to prod any waiting sketch
+                                    _grip._ser.write(b"\r\n")
+                                    raw = _grip.read_raw(timeout=3.0)
+                                    if raw.strip():
+                                        st.code(repr(raw), language=None)
+                                    else:
+                                        st.warning(
+                                            "No bytes received in 3 s. "
+                                            "Is the sketch uploaded? "
+                                            "Try the Arduino IDE Serial Monitor "
+                                            "at 115200 baud to verify."
+                                        )
+                                except GripperError as e:
+                                    st.error(str(e))
 
     st.markdown("---")
 
