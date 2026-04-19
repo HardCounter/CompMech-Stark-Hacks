@@ -169,6 +169,14 @@ installed, copy the `.hef` to the Pi, and load it via `--grasp-hef`. The
 script flags known risks (dual-input support in older DFC versions); the
 default CPU ONNX Runtime path is fine for the demo if the compile fails.
 
+**Training / fine-tuning on Azure GPU (Phase B).** The hackathon-grade
+GPU-VM runbook lives at [`infra/azure/README.md`](infra/azure/README.md).
+It provisions a single-GPU VM (default `Standard_NC4as_T4_v3`, 1x T4 16 GB)
+with CUDA + drivers preinstalled, locks SSH to your public IP, enables
+auto-shutdown, and bootstraps the repo in a `.venv` with a CUDA torch
+wheel. Training itself still needs the dataset layer in
+`scripts/train_gqcnn.py` filled in (see the `build_dataset` TODO).
+
 ### Optional extras
 
 Declared in `pyproject.toml`:

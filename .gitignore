@@ -5,6 +5,11 @@
 Technical_Ford_Grasping.pdf
 *.xlsx
 
+# Azure GPU VM provisioning secrets + artefacts
+infra/azure/.env
+infra/azure/keys/
+infra/azure/.vm_info
+
 
 ### Linux ###
 *~
